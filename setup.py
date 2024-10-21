@@ -50,7 +50,9 @@ else:
         IS_ROCM = True
 
 PACKAGE_NAME = "flash_attn"
-
+# 
+# Here's where the module gets set if you're doing 2.0
+# 
 BASE_WHEEL_URL = (
     "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
 )

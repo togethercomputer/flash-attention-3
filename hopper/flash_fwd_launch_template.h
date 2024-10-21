@@ -17,9 +17,52 @@
 #include "seq_len.h"
 #include "utils.h"
 #include "combine.h"
-
-template<typename Kernel_traits, bool Is_causal, bool Is_local, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
+//
+// The string "new" doesn't appear here...what happens to params.{k,v}new?
+// 
+// This file is fairly different from its FA2 counterpart:
+//
+// - This one contains no __global__s. 
+//
+// - FA2 launch_template def's three __global__s (using that funky macro):
+//
+/*   - (fa2) 
+//     template <...>
+//     flash_fwd_kernel
+// 
+//   - (fa2) 
+//     template <...>
+//     flash_fwd_splitkv_kernel
+// 
+//   - (fa2) 
+//     template <...>
+//     flash_fwd_splitkv_combine_kernel
+*/
+// Also in FA2/flash_fwd_launch_template, in place of the articulation point
+// FA3/run_flash_fwd are two functions FA2/run_flash_fwd and
+// FA2/run_flash_splitkv_fwd, the latter handling kernels 2 and 3 above.
+//
+// The top-level structure in this file isn't so Cutlass-y, despite this being
+// FA3. Inside `run_flash_fwd` gets more Cutlass-y.
+//
+// This one calls to_underlying_arguments, so I guess in some sense you could
+// think of it like the device layer.
+//
+// But because the kernel layer is not as Cutlass-y, instead of calling one big
+// t_u_a on the kernel, it has to do it on all the collectives individually.
+//
+template<
+  typename Kernel_traits, 
+  bool Is_causal, 
+  bool Is_local, 
+  typename Seqlen_traits, 
+  typename Seqlen_traits_Q = Seqlen_traits
+>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+    //
+    // EA: OK, is_causal and is_local are mutually exclusive; I'm not sure I
+    // could explain why
+    //
     static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -31,59 +74,104 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(Seqlen_traits_Q::UseGQAPacking == (Kernel_traits::kBlockH > 1), "If kBlockH > 1, use gqa packed layouts");
     static_assert(!(Is_split && Seqlen_traits::UseVarSeqLen), "Split KV not yet supported for variable seqlen.");
 
-    using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>;
+    using CollectiveMainloop = flash::CollectiveMainloopFwd<
+      Kernel_traits, 
+      Is_causal, 
+      Is_local, 
+      Seqlen_traits, 
+      Seqlen_traits_Q
+    >;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits, Seqlen_traits_Q>;
+//                                                                                            choose TileScheduler
     using Scheduler = std::conditional_t<
-        Seqlen_traits::UseVarSeqLen, 
-        flash::SingleTileScheduler,
-        std::conditional_t<!Is_causal && !Is_local && !Is_split,
-            flash::StaticPersistentTileScheduler<Is_split>,
-            flash::DynamicPersistentTileScheduler<
-                Kernel_traits::kNThreads - cutlass::NumThreadsPerWarpGroup,
-                Kernel_traits::NumProducerThreads,
-                Is_split
-            >
-    >>;
+      Seqlen_traits::UseVarSeqLen, 
+      flash::SingleTileScheduler,
+      std::conditional_t<
+        !Is_causal && !Is_local && !Is_split,
+          flash::StaticPersistentTileScheduler<Is_split>,
+          flash::DynamicPersistentTileScheduler<
+            Kernel_traits::kNThreads - cutlass::NumThreadsPerWarpGroup,
+            Kernel_traits::NumProducerThreads,
+            Is_split
+          >
+        >
+    >;
     // using Scheduler = flash::SingleTileScheduler;
     Seqlen_traits_Q seqlen_traits_q(
         params.total_q, params.seqlen_q, params.cu_seqlens_q, params.seqused_q);
     Seqlen_traits seqlen_traits_k(
         params.total_k, params.seqlen_k, params.cu_seqlens_k, params.seqused_k);
-
+//                                                                                     CM::to_underlying_arguments
     typename CollectiveMainloop::Params mainloop_params =
         CollectiveMainloop::to_underlying_arguments({
-            static_cast<Element const*>(params.q_ptr),            
-            seqlen_traits_q.get_gmem_layout(
-                params.seqlen_q, params.d, params.h_k, params.b, params.h_h_k_ratio, 
-                params.q_row_stride, params.q_head_stride, params.q_batch_stride
-            ),  // layout_Q
-            static_cast<Element const*>(params.k_ptr),
-            seqlen_traits_k.get_gmem_layout(
-                params.seqlen_k, params.d, params.h_k, params.b_k, 
-                params.k_row_stride, params.k_head_stride, params.k_batch_stride,
-                params.page_block_size, params.page_num_blocks
+            static_cast<Element const*>(params.q_ptr),//        ->                 ptr_Q        
+            seqlen_traits_q.get_gmem_layout(//                  -> SLt_Q::LayoutT  layout_Q
+                params.seqlen_q,    
+                params.d,    
+                params.h_k,    
+                params.b,    
+                params.h_h_k_ratio,    
+                params.q_row_stride,    
+                params.q_head_stride,    
+                params.q_batch_stride   
+            ),  // layout_Q   
+            static_cast<Element const*>(params.k_ptr),//        ->                ptr_K
+            seqlen_traits_k.get_gmem_layout(//                  -> SLt_K::LayoutT layout_K
+                params.seqlen_k, 
+                params.d, 
+                params.h_k, 
+                params.b_k, 
+                params.k_row_stride, 
+                params.k_head_stride, 
+                params.k_batch_stride,
+                params.page_block_size, 
+                params.page_num_blocks
             ),  // layout_K
-            static_cast<Element const*>(params.v_ptr),
-            seqlen_traits_k.get_gmem_layout(
-                params.seqlen_k, params.d, params.h_k, params.b_k, 
-                params.v_row_stride, params.v_head_stride, params.v_batch_stride,
-                params.page_block_size, params.page_num_blocks
+            static_cast<Element const*>(params.v_ptr),//       ->                 ptr_V
+            seqlen_traits_k.get_gmem_layout(//                 ->                 layout_V
+                params.seqlen_k, 
+                params.d, 
+                params.h_k, 
+                params.b_k, 
+                params.v_row_stride, 
+                params.v_head_stride, 
+                params.v_batch_stride,
+                params.page_block_size, 
+                params.page_num_blocks
             ),  // layout_V
-            seqlen_traits_k.get_virtual_shape(params.seqlen_k, params.d, params.h_k, params.b, params.h_h_k_ratio, false),
-            params.scale_softmax_log2,
-            params.descale_q_ptr,
-            params.descale_k_ptr,
-            params.descale_v_ptr,
-            params.window_size_left,
-            params.window_size_right,
-            ceil_div(params.h_h_k_ratio, Kernel_traits::kBlockH),
-            params.cache_batch_idx,
-            Is_split ? params.num_splits : 1,
-            params.block_table,
-            params.block_table_batch_stride,
-            params.page_block_size,
-            (params.page_block_size > 0) ? params.b*params.seqlen_k/params.page_block_size : 0
+            seqlen_traits_k.get_virtual_shape(//                -> SLt::ShapeT   shape_KV
+              params.seqlen_k,  
+              params.d,  
+              params.h_k,  
+              params.b,  
+              params.h_h_k_ratio,  
+              false), 
+            params.scale_softmax_log2,//                        -> float const    softmax_scale_log2
+            params.descale_q_ptr,//                             -> float const*   descale_q_ptr
+            params.descale_k_ptr,//                             -> float const*   descale_k_ptr
+            params.descale_v_ptr,//                             -> float const*   descale_v_ptr
+            params.window_size_left,//                          -> int            window_size_left
+            params.window_size_right,//                         -> int            window_size_right
+            ceil_div(//                                         -> int   const    qhead_per_khead
+              params.h_h_k_ratio,  
+              Kernel_traits::kBlockH), 
+            params.cache_batch_idx,//                           -> int   const*   cache_batch_idx
+            Is_split ? params.num_splits : 1,//                 -> int   const    num_splits
+            params.block_table,//                               -> int        *   block_table
+            //              (^^^ nullptr if not paged)
+            params.block_table_batch_stride,//                  -> int64_t        block_table_batch_stride
+            params.page_block_size,//                           -> int            page_block_size
+            (params.page_block_size > 0) ?//                    -> int            num_blocks
+              params.b*params.seqlen_k/params.page_block_size : 
+              0
         });
+//                                                                                     CE::to_underlying_arguments
+    //
+    // epilogue_params <- immediately invoked lambda
+    //
+    // (I guess so that you can bring the assignment outside the conditional to
+    // make the compiler happy that it's actually assigned?)
+    //
     typename CollectiveEpilogue::Params epilogue_params = [&] {
         if constexpr(!Is_split) {
             return CollectiveEpilogue::to_underlying_arguments({            
@@ -118,8 +206,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     int num_blocks_h = params.h_k * ceil_div(params.h_h_k_ratio, Kernel_traits::kBlockH);
     typename Scheduler::Arguments scheduler_args =
         {num_blocks_m, Is_split ? params.num_splits : 1, num_blocks_h, params.b, params.tile_count_semaphore};
+//                                                                                     TS::to_underlying_arguments
     typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);    
 
+//                                                                                     define `kernel` fcn pointer
     // Get the ptr to kernel function.
     void *kernel;
     if constexpr(cutlass::sizeof_bits_v<Element> == 8)
@@ -149,6 +239,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
     static constexpr int ctaSize = Kernel_traits::kNWarps * 32;
     dim3 block_dims(ctaSize);
+//                                                                                                   launch kernel
     if constexpr(size(ClusterShape{}) > 1) {
         dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
         cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
@@ -200,7 +291,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
       CHECK_CUDA_KERNEL_LAUNCH();
     }
 }
-
+//
+// Isn't it kinda weird that these functions are templated on T but they often
+// have the name of their datatype in the function name? Maybe this goes to what
+// Tri was saying about multiple kinds of fp8
+//
+// Why is is saying BlockM := NumMmaWGs * 64?
+//
 template<typename T>
 void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
@@ -214,12 +311,23 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
               // BOOL_SWITCH(cutlass::ceil_div(params.seqlen_q, 192) % 2 == 0 && !Is_causal && !Is_local && !Is_split
               //             && kNumMmaWGs == 3 && !Seqlen_traits::UseVarSeqLen, UseCluster, [&] {
                 run_flash_fwd<
-                  Flash_fwd_kernel_traits<Headdim, kNumMmaWGs * 64, 128, 4 + kNumMmaWGs * 4,
-                      2, false, UseCluster ? 2 : 1, T, !Seqlen_traits::UseVarSeqLen && Is_split>,
+                  Flash_fwd_kernel_traits<
+                    Headdim,//                      -> HeadDim
+                    kNumMmaWGs * 64,//              -> BlockM
+                    128,//                          -> BlockN
+                    4 + kNumMmaWGs * 4,//           -> NWarps
+                    2,//                            -> Stages
+                    false,//                        -> Is_Q_in_regs
+                    UseCluster ? 2 : 1,//           -> ClusterM
+                    T,//                            -> elem_type
+                       !Seqlen_traits::UseVarSeqLen
+                    && Is_split//                   -> Is_split
+                    // (nothing)                    -> BlockH (= 1)
+                  >,
                   Is_causal,
                   Is_local && !Is_causal,
-                  Seqlen_traits,
-                  Seqlen_traits_Q
+                  Seqlen_traits,//                  <- flash::PagedSeqLenTraits if params.page_block_size > 0
+                  Seqlen_traits_Q//                 <- flash::VarSeqLenTraits
                 >(params, stream);
               // });
             });
@@ -260,8 +368,6 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
       });
     });
 }
-
-
 
 template<typename T>
 void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {

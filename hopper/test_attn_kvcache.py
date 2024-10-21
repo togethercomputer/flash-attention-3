@@ -152,7 +152,16 @@ def attention_ref(
         (8, 2),
     ],
 )
-def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, gqa_parallel):
+def test_flash_attn_kvcache_nosplit(
+    nheads_kv, 
+    gqa_ratio, 
+    num_requests, 
+    query_seqlen, 
+    context_seqlen, 
+    headdim, 
+    causal, 
+    gqa_parallel):
+
     device = "cuda"
     num_caches = num_requests
     cache_seqlen = context_seqlen
@@ -214,7 +223,16 @@ def test_flash_attn_kvcache_nosplit(nheads_kv, gqa_ratio, num_requests, query_se
         (8, 2),
     ],
 )
-def test_flash_attn_kvcache_nosplit_fp8(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, gqa_parallel):
+def test_flash_attn_kvcache_nosplit_fp8(
+    nheads_kv, 
+    gqa_ratio, 
+    num_requests, 
+    query_seqlen, 
+    context_seqlen, 
+    headdim, 
+    causal, 
+    gqa_parallel):
+
     device = "cuda"
     num_caches = num_requests
     cache_seqlen = context_seqlen
@@ -289,7 +307,19 @@ def test_flash_attn_kvcache_nosplit_fp8(nheads_kv, gqa_ratio, num_requests, quer
         (1, 32),
     ],
 )
-def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, use_heuristic_only, cache_seqlen_rand, gqa_parallel, dtype):
+def test_flash_attn_kvcache_output(
+    nheads_kv, 
+    gqa_ratio, 
+    num_requests, 
+    query_seqlen, 
+    context_seqlen, 
+    headdim, 
+    causal, 
+    use_heuristic_only, 
+    cache_seqlen_rand, 
+    gqa_parallel, 
+    dtype):
+
     device = "cuda"
     num_caches = 16
     if context_seqlen <= 65536:
@@ -366,9 +396,9 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
                 lse_mean_diff = (lse_ref - lse_fa3).abs().mean().item()
                 assert ((lse_max_ref == math.inf and lse_max_fa3 == math.inf) or lse_max_diff <= 1e-3)
                 assert ((lse_mean_ref == math.inf and lse_mean_fa3 == math.inf) or lse_mean_diff <= 1e-4)
-
-
-
+#
+# vvv Here's the only reference to fp8, gets passed -> dtype
+#
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("use_heuristic_only", [True])
 # @pytest.mark.parametrize("use_heuristic_only", [False])
@@ -396,7 +426,19 @@ def test_flash_attn_kvcache_output(nheads_kv, gqa_ratio, num_requests, query_seq
         (1, 32),
     ],
 )
-def test_flash_attn_kvcache_output_fp8(nheads_kv, gqa_ratio, num_requests, query_seqlen, context_seqlen, headdim, causal, use_heuristic_only, cache_seqlen_rand, gqa_parallel, dtype):
+def test_flash_attn_kvcache_output_fp8(
+    nheads_kv, 
+    gqa_ratio, 
+    num_requests, 
+    query_seqlen, 
+    context_seqlen, 
+    headdim, 
+    causal, 
+    use_heuristic_only, 
+    cache_seqlen_rand, 
+    gqa_parallel, 
+    dtype):
+
     device = "cuda"
     num_caches = 16
     if context_seqlen <= 65536:
@@ -416,32 +458,73 @@ def test_flash_attn_kvcache_output_fp8(nheads_kv, gqa_ratio, num_requests, query
         (num_caches, cache_seqlen, nheads_kv, headdim), device="cuda", dtype=torch.bfloat16
     )
     q = torch.randn((num_requests, query_seqlen, nheads_q, headdim), device="cuda", dtype=torch.bfloat16)
-
+    #
+    # q, k_cache, v_cache all converted to torch.float8_e4m3fn
+    #
     q = q.to(dtype)
     k_cache = k_cache.to(dtype)
     v_cache = v_cache.to(dtype)
-    cache_idxs = torch.randperm(num_caches, dtype=torch.int32, device="cuda")[:num_requests]
-    cache_seqlens = torch.randint(1, context_seqlen-1, (num_requests,), dtype=torch.int32).to(device) if cache_seqlen_rand else torch.tensor([context_seqlen] * num_requests, dtype=torch.int32, device="cuda")
-    torch.cuda.synchronize()
 
+    cache_idxs = torch.randperm(num_caches, dtype=torch.int32, device="cuda")[:num_requests]
+    cache_seqlens = (torch.randint(
+                        1, 
+                        context_seqlen-1, 
+                        (num_requests,), 
+                        dtype=torch.int32).to(device) 
+                    
+                    if cache_seqlen_rand 
+
+                    else torch.tensor(
+                        [context_seqlen] * num_requests,
+                        dtype=torch.int32, 
+                        device="cuda"))
+
+    torch.cuda.synchronize()
 
     descale_q = torch.tensor([1.0], dtype=torch.float32, device='cuda')
     descale_k = torch.tensor([1.0], dtype=torch.float32, device='cuda')
     descale_v = torch.tensor([1.0], dtype=torch.float32, device='cuda')
-
+    #
+    # Why is this vvv one the "ref"? Is this calling fa2 somehow?
+    # 
+    # I guess I need to get concrete on how they're different
+    #
     out_ref, lse_ref = flash_attn_interface.flash_attn_with_kvcache(
                     q=q,
                     k_cache=k_cache,
                     v_cache=v_cache,
+                    #
+                    # k, v not being here (as they are in
+                    # flash_attn_varlen_func) reflect the fact that in place kv
+                    # cache update isn't present yet.
+                    #
+                    # rotary_cos, rotary_sin not being here (as they are in
+                    # flash_attn_varlen_func) reflect the fact that RoPE isn't
+                    # supported yet for 3.0
+                    # 
                     cache_seqlens=cache_seqlens,
                     cache_batch_idx=cache_idxs,
+                    # softmax_scale <- None
                     causal=causal,
+                    # window_size   <- (-1, -1)
                     num_splits=1,
+                    # 
+                    # Here ^^^ num splits <- 1, below it's i
+                    # 
                     return_softmax_lse=True,
                     gqa_parallel=False,
-                    descale_q=descale_q, descale_k=descale_k, descale_v=descale_v
+                    # 
+                    # Here ^^^ gqa_parallel <- false, below it uses the
+                    # parameter passed at the top
+                    #
+                    # max_seqlen_k_hint <- None
+                    descale_q=descale_q, 
+                    descale_k=descale_k, 
+                    descale_v=descale_v
                 )
-
+    # 
+    # EA: I don't understand this vvv comment
+    # 
     # i=0 case is with num splits heuristic
     for i in range(0, max_splits+1):
                 out_fa3, lse_fa3 = flash_attn_interface.flash_attn_with_kvcache(
@@ -451,27 +534,35 @@ def test_flash_attn_kvcache_output_fp8(nheads_kv, gqa_ratio, num_requests, query
                     cache_seqlens=cache_seqlens,
                     cache_batch_idx=cache_idxs,
                     causal=causal,
-                    num_splits=i,
+                    num_splits=i,#         num splits <- i
                     return_softmax_lse=True,
                     gqa_parallel=gqa_parallel,
                     max_seqlen_k_hint=context_seqlen,
-                    descale_q=descale_q, descale_k=descale_k, descale_v=descale_v
+                    descale_q=descale_q, 
+                    descale_k=descale_k, 
+                    descale_v=descale_v
                 )
 
                 torch.cuda.synchronize()
+
                 print ('output-ref', i, out_ref)
                 print ('output-fa3',i, out_fa3)
                 print ('output-max-diff', i, context_seqlen, (out_ref - out_fa3).abs().max().item())
                 print ('output-mean-diff',i, context_seqlen, (out_ref - out_fa3).abs().mean().item())
                 print ('lse-max-diff',i, context_seqlen, (lse_ref - lse_fa3).abs().max().item())
                 print ('lse-mean-diff',i,  context_seqlen, (lse_ref - lse_fa3).abs().mean().item())
-
+                # 
+                # Aren't I surprised that it's calling an assert against the ref
+                # for *each* i in range?
+                # 
                 if cache_seqlen_rand:
                     assert ((out_ref - out_fa3).abs().max().item() <= 1e-1)
                     assert ((out_ref - out_fa3).abs().mean().item() <= 1e-2)
+
                 else:
                     assert ((out_ref - out_fa3).abs().max().item() <= 2e-2)
                     assert ((out_ref - out_fa3).abs().mean().item() <= 2e-3)
+
                 lse_max_ref = lse_ref.abs().max().item()
                 lse_mean_ref = lse_ref.abs().mean().item()
                 lse_max_fa3 = lse_fa3.abs().max().item()

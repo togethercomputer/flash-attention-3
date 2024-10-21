@@ -147,7 +147,11 @@ struct Flash_fwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<DefaultCopy, ElementAccum>{},
                         GmemLayoutAtomOaccum{},
                         Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per store
+//                                                                                   Define GmemTiledCopyRotcossin
     using GmemLayoutAtomRotcossin = GmemLayoutAtom;
+    //
+    // So is the former one, the one wo the suffix, the interleaved one?
+    //
     using GmemTiledCopyRotcossin = decltype(
         make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, Element>{},
                         GmemLayoutAtomRotcossin{},
@@ -157,9 +161,12 @@ struct Flash_fwd_kernel_traits : public Base {
                         GmemLayoutAtomRotcossin{},
                         Layout<Shape < _1, _8>>{}));  // Val layout, 8 vals per load
 };
-
-// Is_V_in_regs is an option to reduce smem usage, but will increase register pressue.
-// No_double_buffer is another option to reduce smem usage, but will slow things down.
+//
+// EA: Interesting, in FA3 it's Is_Q_in_regs
+//
+// Is_V_in_regs is an option to reduce smem usage, but will increase register
+// pressue. No_double_buffer is another option to reduce smem usage, but will
+// slow things down.
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
          int AtomLayoutMSdP_=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=2,
          bool Is_V_in_regs_=false, bool No_double_buffer_=false, typename elem_type=cutlass::half_t,

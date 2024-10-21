@@ -14,12 +14,35 @@
 #include "cutlass/pipeline/pipeline.hpp"
 
 using namespace cute;
-
-template <int kStages, class Gemm1Type, class Gemm2Type, class OutputType, class SmemLayoutQ,
-          class SmemLayoutK, class SmemLayoutV, class SmemLayoutO>
+//
+// Interesting how the SharedStorage structs have anonymous structs and unions
+// inside...how would you ever access that memory if it's anonymous?
+//
+// According to Claude, it the memory layout would be the same with the inner
+// struct or without (provided the vars were given in the same order) but the
+// anonymous struct is for readability? I don't see the point personally, but
+// whatever.
+//
+// You can then refer to the inner vars as if they were just in the outer struct
+// as usual.
+//
+// What's an ezample of a tem.arg for tem.params Gemm1Type, Gemm2Type?
+//
+template <
+  int kStages, 
+  class Gemm1Type, 
+  class Gemm2Type, 
+  class OutputType, 
+  class SmemLayoutQ,
+  class SmemLayoutK, 
+  class SmemLayoutV, 
+  class SmemLayoutO
+>
 struct SharedStorageQKVO {
+
     cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutQ>> smem_q;
     cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutK>> smem_k;
+
     union {
         cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;
         cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
@@ -55,8 +78,14 @@ struct SharedStorageQKVOaccum {
 };
 
 // SharedStorage struct with no smem for O
-template <int kStages, class Gemm1Type, class Gemm2Type, class SmemLayoutQ,
-          class SmemLayoutK, class SmemLayoutV>
+template <
+  int kStages, 
+  class Gemm1Type, 
+  class Gemm2Type, 
+  class SmemLayoutQ,
+  class SmemLayoutK, 
+  class SmemLayoutV
+>
 struct SharedStorageQKV {
     cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutQ>> smem_q;
     cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutK>> smem_k;
@@ -142,34 +171,65 @@ struct SharedStorageQKVVt {
     bool seqlen_init_k;
   };
 };
-
+//
+// EA: Why is there only a kClusterM tem.param in the kernel_traits, not a
+// ClusterN?
+//
+// EA: Are kBlock{M, N, H} tile coordinates?
+//
 // If Share_Q_K_smem is true, that forces Is_Q_in_regs to be true
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kStages_, bool Is_Q_in_regs_=false,
-         int kClusterM_ = 1, typename elem_type=cutlass::half_t, bool Is_split_=false, int kBlockH_ = 1>
+template<
+  int kHeadDim_, 
+  int kBlockM_, 
+  int kBlockN_, 
+  int kNWarps_, 
+  int kStages_, 
+  bool Is_Q_in_regs_=false,
+  int kClusterM_ = 1, 
+  typename elem_type=cutlass::half_t, 
+  bool Is_split_=false, 
+  int kBlockH_ = 1
+>
 struct Flash_fwd_kernel_traits {
     using Element = elem_type;
     using ElementAccum = float;
     using FinalOutputType = elem_type;
+    //
+    // What does is_split have to do with the output type being float?
+    //
     using OutputType = std::conditional_t<Is_split_, float, FinalOutputType>;
     using index_t = int64_t;
 
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;
     static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
+    // 
+    // One producer warp
+    // 
     static constexpr int NumProducerThreads = cutlass::NumThreadsPerWarp;
 
     static constexpr bool Is_Q_in_regs = Is_Q_in_regs_;
     static_assert(kNWarps_ == 8 || kNWarps_ == 12 || kNWarps_ == 16);
     static constexpr bool Is_WS = true;
     static_assert(!(Is_WS && Is_Q_in_regs), "Warp-specialization does not support Q in registers");
-
+    //
+    // Wait, what? is_WS is hard-coded to true and that implies !is_Q_in_regs?
+    //
     static constexpr int kBlockM = kBlockM_;
     static constexpr int kBlockN = kBlockN_;
     static constexpr int kBlockH = kBlockH_;
     static constexpr int kHeadDim = kHeadDim_;
     static_assert(kHeadDim % 32 == 0);
     static_assert(kBlockM % kBlockH == 0);
-    using TileShape_MNK = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
+    //
+    // Is this vvv saying there is only one tile in k? The tile size is the
+    // entire head dimension?
+    //
+    using TileShape_MNK = Shape<
+      Int<kBlockM>, 
+      Int<kBlockN>, 
+      Int<kHeadDim>
+    >;
 
     static constexpr int kClusterM = kClusterM_;
     using ClusterShape_MNK = Shape<Int<kClusterM>, _1, _1>;
@@ -178,8 +238,22 @@ struct Flash_fwd_kernel_traits {
 
     static constexpr bool Is_split = Is_split_;
     static constexpr bool No_smem_O = Is_split;
-
-    using AtomLayoutMNK = Layout<Shape<Int<kBlockM / 64>, _1, _1>>;
+    //
+    // Interesting, ^^^ No_smem_O := Is_split
+    //
+    using AtomLayoutMNK = Layout<Shape<
+      Int<kBlockM / 64>, 
+      _1, 
+      _1
+    >>;
+    //
+    // Interesting, rs_op_selector and ss_op_selector type functions
+    //
+    // TiledMma0 is rs         (if  is_Q_in_regs)
+    //              ss         (if !is_Q_in_regs)
+    // 
+    // TiledMma1 is rs always
+    // 
     using TiledMma0 = decltype(cute::make_tiled_mma(
         std::conditional_t<
             Is_Q_in_regs,
@@ -215,7 +289,9 @@ struct Flash_fwd_kernel_traits {
     using SmemLayoutV =
         decltype(tile_to_shape(SmemLayoutAtomV{},
                  make_shape(get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), Int<kStages>{})));
-
+    // 
+    // EA: vvv Huh?
+    // 
     // Note this is the transpose in terms of the view, not in terms of memory.
     using SmemLayoutVt =
         decltype(composition(SmemLayoutV{},
@@ -233,9 +309,27 @@ struct Flash_fwd_kernel_traits {
 
     using SmemCopyAtomQ = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
 
-    using SharedStorage = std::conditional_t<!No_smem_O,
-        SharedStorageQKVO<kStages, Element, Element, OutputType, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>,
-        SharedStorageQKV<kStages, Element, Element, SmemLayoutQ, SmemLayoutK, SmemLayoutV>>;
+    using SharedStorage = std::conditional_t<
+      !No_smem_O,
+      SharedStorageQKVO<
+        kStages,
+        Element,//      -> Gemm1Type
+        Element,//      -> Gemm2Type
+        OutputType,
+        SmemLayoutQ, 
+        SmemLayoutK, 
+        SmemLayoutV, 
+        SmemLayoutO
+      >,
+      SharedStorageQKV<
+        kStages, 
+        Element, 
+        Element, 
+        SmemLayoutQ, 
+        SmemLayoutK, 
+        SmemLayoutV
+      >
+    >;
 
     using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
     using MainloopPipelineNoTMA = typename cutlass::PipelineAsync<kStages>;
@@ -243,10 +337,22 @@ struct Flash_fwd_kernel_traits {
     // using BarrierType = typename MainloopPipeline::ProducerBarrierType;
 
 };
-
+// 
+// EA: So I assume below they're referring to 
+// 
 // Traits struct for fp8 kernel with in-kernel transpose
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, int kStages_, bool Is_Q_in_regs_=false,
-         int kClusterM_ = 1, typename elem_type=cutlass::float_e4m3_t, bool Is_split_ = false, int kBlockH_ = 1>
+template<
+  int kHeadDim_, 
+  int kBlockM_, 
+  int kBlockN_, 
+  int kNWarps_, 
+  int kStages_, 
+  bool Is_Q_in_regs_=false,
+  int kClusterM_ = 1,
+  typename elem_type=cutlass::float_e4m3_t, 
+  bool Is_split_ = false, 
+  int kBlockH_ = 1
+>
 struct Flash_fwd_kernel_traits_fp8 {
     using Element = elem_type;
     static_assert(cutlass::sizeof_bits_v<Element> == 8);
@@ -257,8 +363,12 @@ struct Flash_fwd_kernel_traits_fp8 {
 
     static constexpr bool Is_split = Is_split_;
     static constexpr bool No_smem_O = false;
-    // NOTE: not using smem for epilogue degrades perf substantially.
-    // static constexpr bool No_smem_O = Is_split;
+    // NOTE: not using smem for epilogue degrades perf substantially. static
+    // constexpr bool No_smem_O = Is_split;
+    //
+    // EA: Not using smem, meaning what? Eschewing TMA, and doing elementwise
+    // copies from rmem to gmem?
+    //
 
     // The number of threads.
     static constexpr int kNWarps = kNWarps_;

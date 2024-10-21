@@ -10,7 +10,10 @@
 #include "cutlass/fast_math.h"  // For cutlass::FastDivmod
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
+//
+// So I guess the fact that there's no {q, k, v, o}_col_stride implies that
+// they're all assumed column-major?
+//
 struct Qkv_params {
     using index_t = int64_t;
     // The QKV matrices.
@@ -31,13 +34,15 @@ struct Qkv_params {
 
     // The number of heads.
     int h, h_k;
-    // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
-    // different from nheads (query).
+    // In the case of multi-query and grouped-query attention (MQA/GQA),
+    // nheads_k could be different from nheads (query).
     int h_h_k_ratio; // precompute h / h_k,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
+// 
+// What is oaccum_split_stride? ("Split"?)
+// 
 struct Flash_fwd_params : public Qkv_params {
 
     // The O matrix (output).
@@ -63,7 +68,17 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ softmax_lseaccum_ptr;
 
     // The dimensions.
-    int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q, total_k;
+    int b, 
+        seqlen_q, 
+        seqlen_k, 
+        seqlen_knew, 
+        d, 
+        seqlen_q_rounded, 
+        seqlen_k_rounded, 
+        d_rounded, 
+        rotary_dim, 
+        total_q, 
+        total_k;
     int b_k;
 
     // The scaling factors for the kernel.
@@ -129,7 +144,6 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_local;
     bool is_kv_cache;
     bool use_gqa_packing;
-
     bool is_rotary_interleaved;
 
     int num_splits;  // For split-KV version
@@ -192,7 +206,24 @@ struct Flash_bwd_params : public Flash_fwd_params {
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// It's interesting that these functions take the Flash_fwd_params by non-const
+// reference while the actual kernels take {CM, CE, TS}::Params by const value.
+//
+// Maybe the latter is the Cutlass-y way, see them as const pointers to
+// non-const values, and the cruft in between is translating the older FA style
+// into a Cutlass-y idiom.
+//
+template<typename T, int Headdim> 
+void 
+run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 
-template<typename T, int Headdim> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
-template<typename T, int Headdim, int kBlockH> void run_mha_fwd_gqa_(Flash_fwd_params &params, cudaStream_t stream);
-template<typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim, int kBlockH> 
+void 
+run_mha_fwd_gqa_(Flash_fwd_params &params, cudaStream_t stream);
+//
+// gqa must be "grouped query attention"
+//
+template<typename T, int Headdim> 
+void 
+run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);

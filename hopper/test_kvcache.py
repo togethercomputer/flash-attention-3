@@ -227,8 +227,16 @@ def main():
             num_splits=args.splits
     )
 
-    print ('big (split, fa3, fa2, ratio):', args.splits, time_fa3_big * 1000000, time_fa2_big * 1000000, time_fa3_big / time_fa2_big)
-    print ('small (split, fa3, fa2, ratio):', args.splits, time_fa3_small * 1000000, time_fa2_small * 1000000, time_fa3_small / time_fa2_small)
+    print ('big (split, fa3, fa2, ratio):', 
+            args.splits, 
+            time_fa3_big * 1000000, 
+            time_fa2_big * 1000000, 
+            time_fa3_big / time_fa2_big)
+    print ('small (split, fa3, fa2, ratio):', 
+            args.splits, 
+            time_fa3_small * 1000000, 
+            time_fa2_small * 1000000, 
+            time_fa3_small / time_fa2_small)
 
 if __name__ == "__main__":
     main()

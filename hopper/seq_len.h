@@ -98,10 +98,19 @@ public:
   CUTLASS_HOST SeqLenTraits() {}
 
   CUTLASS_HOST SeqLenTraits(
-      int sum_s, int max_seq_len, int *cu_seq_len = nullptr, int *seq_used = nullptr): 
-      sum_s(sum_s), cu_seq_len(cu_seq_len), seq_used(seq_used), actual_seq_len(max_seq_len) {}
+      int sum_s, 
+      int max_seq_len, 
+      int *cu_seq_len = nullptr, 
+      int *seq_used = nullptr) :
+      sum_s(sum_s), 
+      cu_seq_len(cu_seq_len), 
+      seq_used(seq_used), 
+      actual_seq_len(max_seq_len) {}
 
   CUTLASS_DEVICE void init(int bidb) {
+    // 
+    // EA: Want to understand this vvv
+    // 
     // TODO: add leftpad, seqlen_new for kv cache support
     if (seq_used) {
       actual_seq_len = seq_used[bidb];
@@ -113,28 +122,37 @@ public:
   }
 
   // Returns the layout of a tensor in MKHB format in global memory.
+  //
   // padded: only useful for var-seq-len for dq_accum and softmax_d.
   CUTLASS_HOST_DEVICE auto get_gmem_layout(
       int m, int k, int h, int b, 
       int64_t m_stride, int64_t h_stride, int64_t b_stride,
-      int page_block_size, int num_blocks,
-      bool padded = false) const {
+      int page_block_size, 
+      int num_blocks,
+      bool padded = false) const 
+  {
     static_assert(!UseVarSeqLen, "Specialize default implementation for VarSeqLen.");
     // static_assert(!UseGQAPacking, "Specialize default implementation for UseGQAPacking.");
     return make_layout(make_shape(m, k, h, b),
                        make_stride(m_stride, cute::_1{}, h_stride, b_stride));
   }
-
-
-  // Returns the layout of a tensor in MKHB format in virtual memory space
-  // that is mapped to the global memory via the block table when paged attention is used
+  //
+  // EA: Look at this, mentions paged attention
+  //
+  // Returns the layout of a tensor in MKHB format in virtual memory space that
+  // is mapped to the global memory via the block table when paged attention is
+  // used
   CUTLASS_HOST_DEVICE VirtualShapeT get_virtual_shape(
-      int m, int k, int h_k, int b, int h_h_k_ratio, bool padded) const {
+    int m, int k, int h_k, int b, int h_h_k_ratio, 
+    bool padded) const 
+  {
     return make_shape(m, k, h_k, b);
   }
-
+  //
   // Returns the layout of a tensor in MKHB format in global memory.
+  //
   // padded: only useful for var-seq-len for dq_accum and softmax_d.
+  //
   // Overload that separates h into h_k and h/h_k.
   CUTLASS_HOST_DEVICE auto get_gmem_layout(
       int m, int k, int h_k, int b, int h_h_k_ratio,
@@ -234,7 +252,16 @@ using FixedSeqLenTraits = SeqLenTraits<false, false, false>;
 using VarSeqLenTraits = SeqLenTraits<true, false, false>;
 using PagedSeqLenTraits = SeqLenTraits<true, true, false>;
 using FixedGQASeqLenTraits = SeqLenTraits<false, false, true>;
-
+//
+// OK, interesting, so below we see an externally defined template
+// specialization for `SeqLenTraits::init`. This is specializing on the hidden
+// template parameter of 
+//
+/* VarSeqLenTraits := alias for SeqLenTraits<
+ *   UseVarSeqLen_   <- true
+ *   UseGQAPacking_  <- false
+ * >
+*/
 template <>
 CUTLASS_DEVICE void VarSeqLenTraits::init(int bidb) {
   actual_seq_len = 

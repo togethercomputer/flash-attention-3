@@ -16,6 +16,10 @@
 #include "flash.h"
 #include "utils.h"
 #include "softmax.h"
+//
+// OK, so utils etc aside, this thing is on the kernel layer and it's importing
+// only the three FA3 entities on the collective layer
+//
 #include "tile_scheduler.hpp"
 #include "mainloop_fwd_sm90_tma_gmma_ws.hpp"
 #include "epilogue_fwd_sm90_tma.hpp"
@@ -23,15 +27,49 @@
 namespace flash {
 
 using namespace cute;
-
-template <typename Ktraits, bool Is_causal, bool Is_local, typename TileScheduler, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
+//
+// It takes the mainloop_params and epilogue_params as const values, so how does
+// it handle output arguments? Oh, maybe the way to think of it is like these
+// params are const pointers to non-const types
+//
+// Interesting that they chose to make this one a fcn not a struct with
+// Arguments, Params, to_underlying_params, etc
+//
+// Maybe the functions in flash_fwd_launch_template can be seen as serving this
+// function? I should keep an eye out there for something that looks like eg
+// to_underlying_params.
+//
+template <
+  typename Ktraits, 
+  bool Is_causal, 
+  bool Is_local, 
+  typename TileScheduler, 
+  typename Seqlen_traits, 
+  typename Seqlen_traits_Q = Seqlen_traits
+>
 __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
-    compute_attn_ws(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>::Params const mainloop_params,
-                    CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>::Params const epilogue_params,
-                    CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params,
-                    Seqlen_traits_Q seqlen_traits_q, Seqlen_traits seqlen_traits_k
-                    ) {
-
+compute_attn_ws(
+  
+  CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<
+    Ktraits, 
+    Is_causal, 
+    Is_local, 
+    Seqlen_traits, 
+    Seqlen_traits_Q
+  >::Params const mainloop_params,
+  
+  CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<
+    Ktraits, 
+    Seqlen_traits_Q
+  >::Params const epilogue_params,
+  
+  CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params,
+  
+  Seqlen_traits_Q seqlen_traits_q, 
+  
+  Seqlen_traits seqlen_traits_k) 
+  
+{
     using Element = typename Ktraits::Element;
     using TileShape_MNK = typename Ktraits::TileShape_MNK;
     using ClusterShape = typename Ktraits::ClusterShape_MNK;
@@ -99,6 +137,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
 
     // static_assert(Ktraits::kNWarps == 12 || Ktraits::kNWarps == 16);
     static_assert(Ktraits::kNWarps == 8 || Ktraits::kNWarps == 12 || Ktraits::kNWarps == 16);
+//                                                                                                            prod
     if (warp_group_idx == 0) {  // Producer
         cutlass::arch::warpgroup_reg_dealloc<Ktraits::kNWarps == 12 ? 24 : 32>();
 
@@ -108,11 +147,17 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
 
             int work_idx = 0;
-
+//                                                                                                         TS/ctor
             TileScheduler scheduler(&shared_storage.tile_count_semaphore);
+//                                                                                                     for (tiles)
             for (auto work_tile_info = scheduler.get_initial_work();
                  work_tile_info.is_valid(scheduler_params);
-                 work_tile_info = scheduler.template get_next_work</*IsProducer=*/true>(scheduler_params, work_tile_info)) {
+                 work_tile_info = scheduler.template get_next_work<
+                  /*IsProducer=*/true
+                 >(
+                  scheduler_params, 
+                  work_tile_info)) 
+            {
                 auto block_coord = work_tile_info.get_block_coord(scheduler_params);
                 auto [m_block, n_split_idx, bidh, bidb] = block_coord;
 
@@ -135,17 +180,33 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                         continue;
                     }
                 }
+//                                                                                                         CM/load
                 collective_mainloop.load(
-                    mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
-                    shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
-                    seqlen_traits_q, seqlen_traits_k, n_block_min, n_block_max);
+                  mainloop_params, 
+                  pipeline_k, 
+                  pipeline_v, 
+                  smem_pipe_write_k, 
+                  smem_pipe_write_v,
+                  shared_storage, 
+                  scheduler, 
+                  scheduler_params, 
+                  work_tile_info, 
+                  block_coord,
+                  work_idx,
+                  seqlen_traits_q, 
+                  seqlen_traits_k, 
+                  n_block_min, 
+                  n_block_max);
                 ++work_idx;
             }
+//                                                                                                    /for (tiles)
             collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
+//                                                                                                           /prod
         }
+//                                                                                                            cons
     } else {  // Consumer
         cutlass::arch::warpgroup_reg_alloc<Ktraits::kNWarps == 16 ? 160 : Ktraits::kNWarps == 12 ? 240 : 256>();
-
+//                                                                                                         TS/ctor
         TileScheduler scheduler(&shared_storage.tile_count_semaphore);
         // Initialize matmul objects.
         typename Ktraits::TiledMma1 tiled_mma1;
@@ -153,23 +214,31 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
         PipelineState smem_pipe_read_k, smem_pipe_read_v;
         // We don't need separate variables smem_pipe_release_k and smem_pipe_release_v
         // (like in Cutlass's gemm) because the read and release pipeline states are always the same.
-
+//                                                                                                     CM/mma_init
         collective_mainloop.mma_init();
+//                                                                                                TS/init_consumer
         scheduler.init_consumer();
 
         int work_idx = 0;
         CUTLASS_PRAGMA_NO_UNROLL
+//                                                                                                     for (tiles)
         for (auto work_tile_info = scheduler.get_initial_work();
              work_tile_info.is_valid(scheduler_params);
-             work_tile_info = scheduler.template get_next_work</*IsProducer=*/false>(scheduler_params, work_tile_info)) {
+             work_tile_info = scheduler.template get_next_work<
+              /*IsProducer=*/false
+             >(
+              scheduler_params, 
+              work_tile_info)) 
+        {
             // Attention output (GEMM-II) accumulator.
             Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 2>(TileShape_MNK{}));
             flash::Softmax<2 * (2 * kBlockM / NumMmaThreads)> softmax(mainloop_params.softmax_scale_log2);
 
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, n_split_idx, bidh, bidb] = block_coord;
-
+//                                                                                                      SLt_Q/init
             seqlen_traits_q.init(bidb);
+//                                                                                                      SLt_K/init
             seqlen_traits_k.init(bidb);
             if constexpr(seqlen_traits_q.UseVarSeqLen) {
                 // NOTE: to support in future with gqa packed layouts, changed kBlockM to kBlockM/kBlockH
@@ -183,40 +252,97 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                     n_block_min, n_block_max);
             if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
+//                                                                                             CE/store_zero{_gqa}
                     if constexpr(!Seqlen_traits_Q::UseGQAPacking) {
-                        collective_epilogue.store_zero(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
-                            block_coord, seqlen_traits_q);
+                        collective_epilogue.store_zero(
+                          epilogue_params, 
+                          shared_storage, 
+                          threadIdx.x - NumCopyThreads,
+                          block_coord, 
+                          seqlen_traits_q);
                     } else {
-                        collective_epilogue.store_zero_gqa(epilogue_params, shared_storage, threadIdx.x - NumCopyThreads,
-                            block_coord, seqlen_traits_q, mainloop_params.qhead_per_khead_divmod);
+                        collective_epilogue.store_zero_gqa(
+                          epilogue_params, 
+                          shared_storage, 
+                          threadIdx.x - NumCopyThreads,
+                          block_coord, 
+                          seqlen_traits_q, 
+                          mainloop_params.qhead_per_khead_divmod);
                     }
                     continue;
                 }   
             }         
-
+//                                                                                                          CM/mma
+            // 
+            // Maybe ffa3 needs to change this to accept a block coordinate also?
+            // 
             collective_mainloop.mma(
-                mainloop_params, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
-                tOrO, softmax, n_block_min, n_block_max, threadIdx.x - NumCopyThreads, work_idx,
-                m_block, shared_storage, seqlen_traits_q, seqlen_traits_k);
-                // tOrO, softmax, n_block_max, threadIdx.x - NumCopyThreads + (work_idx >> 30), work_idx, shared_storage);
+              mainloop_params,
+              pipeline_k, 
+              pipeline_v, 
+              smem_pipe_read_k, 
+              smem_pipe_read_v,
+              tOrO, 
+              softmax, 
+              n_block_min, 
+              n_block_max, 
+              threadIdx.x - NumCopyThreads,// -> thread_idx
+              work_idx,
+              m_block, 
+              shared_storage, 
+              seqlen_traits_q,// -> SLt_Q const&
+              seqlen_traits_k);// -> SLt_K const&
+              // tOrO, softmax, n_block_max, threadIdx.x - NumCopyThreads + (work_idx >> 30), work_idx, shared_storage);
+//                                                                                                        CE/store
             collective_epilogue.store(
-                epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-                threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q, mainloop_params.qhead_per_khead_divmod);
+              epilogue_params,
+              tOrO,//                                    -> FrgTensorO          const&
+              softmax.row_sum,//                         -> FrgTensorLSE        const& lse
+              shared_storage,//                          -> SharedStorage            &
+              tiled_mma1,//                              -> TiledMma
+              threadIdx.x - NumCopyThreads,//            -> int                        thread_idx
+              block_coord,//                             -> (int32_t)^4         const& block_coord
+              seqlen_traits_q,//                         -> SLt_Q               const& 
+              mainloop_params.qhead_per_khead_divmod);// -> cutlass::FastDivmod      & qhead_per_khead_divmod
 
             ++work_idx;
+//                                                                                                    /for (tiles)
         }
+//                                                                                                   CE/store_tail
         collective_epilogue.store_tail();
-    }
-
+    } // Consumer
+//                                                                                                           /cons
 }
 
-template <typename Ktraits, bool Is_causal, bool Is_local, typename TileScheduler, typename Seqlen_traits, typename Seqlen_traits_Q = Seqlen_traits>
+template <
+  typename Ktraits, 
+  bool Is_causal, 
+  bool Is_local, 
+  typename TileScheduler, 
+  typename Seqlen_traits, 
+  typename Seqlen_traits_Q = Seqlen_traits
+>
 __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
-    compute_attn_ws_fp8(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal, Is_local, Seqlen_traits, Seqlen_traits_Q>::Params const mainloop_params,
-                        CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits_Q>::Params const epilogue_params,
-                        CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params,
-                        Seqlen_traits_Q seqlen_traits_q, Seqlen_traits seqlen_traits_k
-                        ) {
+compute_attn_ws_fp8(
+
+  CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<
+    Ktraits, 
+    Is_causal, 
+    Is_local, 
+    Seqlen_traits, 
+    Seqlen_traits_Q
+  >::Params const mainloop_params,
+  
+  CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<
+    Ktraits, 
+    Seqlen_traits_Q
+  >::Params const epilogue_params,
+  
+  CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params,
+
+  Seqlen_traits_Q seqlen_traits_q,
+
+  Seqlen_traits seqlen_traits_k) {
 
     using Element = typename Ktraits::Element;
     static_assert(cutlass::sizeof_bits_v<Element> == 8);
@@ -351,6 +477,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             //     cutlass::arch::NamedBarrier::sync(NumCopyThreads, static_cast<int>(FwdNamedBarriers::ProducerWG) /*id*/); }
         }
         collective_mainloop.load_tail_one_write(pipeline_k, pipeline_v, smem_pipe_write);
+//                                                                                                            cons
     } else {  // Consumer
         cutlass::arch::warpgroup_reg_alloc<Ktraits::kNWarps == 16 ? 160 : Ktraits::kNWarps == 12 ? 232 : 256>();        
 
@@ -386,8 +513,13 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             }
             int n_block_max, n_block_min = 0;
             collective_mainloop.get_n_block_min_max(
-                    mainloop_params, m_block, n_split_idx, seqlen_traits_q, seqlen_traits_k,
-                    n_block_min, n_block_max);
+                    mainloop_params, 
+                    m_block, 
+                    n_split_idx, 
+                    seqlen_traits_q, 
+                    seqlen_traits_k,
+                    n_block_min, 
+                    n_block_max);
             if constexpr (Is_causal || Is_local || seqlen_traits_k.UseVarSeqLen || Ktraits::Is_split) {
                 if(n_block_max <= n_block_min) {  // We exit early and write 0 to gO and -inf to gLSE.
                     if constexpr(!Seqlen_traits_Q::UseGQAPacking) {
@@ -402,13 +534,32 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             }
             
             collective_mainloop.mma_fp8<Delay_V_release>(
-                mainloop_params, pipeline_k, pipeline_vt, smem_pipe_read, smem_pipe_release,
-                tOrO, softmax, n_block_min, n_block_max, threadIdx.x - NumCopyThreads, work_idx, m_block,
-                shared_storage, seqlen_traits_q, seqlen_traits_k);
+                mainloop_params, 
+                pipeline_k, 
+                pipeline_vt, 
+                smem_pipe_read, 
+                smem_pipe_release,
+                tOrO, 
+                softmax, 
+                n_block_min, 
+                n_block_max, 
+                threadIdx.x - NumCopyThreads, 
+                work_idx,
+                m_block,
+                shared_storage, 
+                seqlen_traits_q, 
+                seqlen_traits_k);
 
             collective_epilogue.store(
-                epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-                threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q, mainloop_params.qhead_per_khead_divmod);
+                epilogue_params, 
+                tOrO, 
+                softmax.row_sum, 
+                shared_storage, 
+                tiled_mma1,
+                threadIdx.x - NumCopyThreads, 
+                block_coord, 
+                seqlen_traits_q, 
+                mainloop_params.qhead_per_khead_divmod);
 
             ++work_idx;
         }

@@ -346,7 +346,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,
         )
 
-
 def flash_attn_func(
     q,
     k,
@@ -505,10 +504,23 @@ def flash_attn_with_kvcache(
     q,
     k_cache,
     v_cache,
-    # k=None,
-    # v=None,
-    # rotary_cos=None,
-    # rotary_sin=None,
+    # 
+    # EA: k, v not being here vvv (as they are in flash_attn_varlen_func) reflect
+    # the fact that in place kv cache update isn't present yet.
+
+    # k=None 
+    # v=None
+
+    # EA: rotary_cos, rotary_sin not being here vvv (as they are in
+    # flash_attn_varlen_func) reflect the fact that RoPE isn't supported yet for
+    # 3.0
+
+    # rotary_cos=None
+    # rotary_sin=None
+
+    # EA: This vvv seems to have an unnecessary layer of parens inside...do they
+    # have no effect?
+    # 
     cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
     # cache_leftpad: Optional[torch.Tensor] = None,
@@ -516,9 +528,14 @@ def flash_attn_with_kvcache(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
+    # 
     # softcap=0.0, # 0.0 means deactivated
+    # 
+    # EA: "rotary interleaved"?
+    # 
     # rotary_interleaved=True,
     # alibi_slopes=None,
+    # 
     num_splits=0,
     return_softmax_lse=False,
     gqa_parallel=None,
@@ -528,96 +545,217 @@ def flash_attn_with_kvcache(
     descale_v=None,
 ):
     """
-    NOTE: The KV cache API for FlashAttention-3 is a work in progress. We reproduce the description
-    from the FlashAttention-2 method of the same name below.
+    NOTE: The KV cache API for FlashAttention-3 is a work in progress. We
+    reproduce the description from the FlashAttention-2 method of the same name
+    below.
 
-    If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
-    k and v. This is useful for incremental decoding: you can pass in the cached keys/values from
-    the previous step, and update them with the new keys/values from the current step, and do
-    attention with the updated cache, all in 1 kernel.
+    EA: So I guess don't take anything below this point too literally w.r.t. FA3
 
-    If you pass in k / v, you must make sure that the cache is large enough to hold the new values.
-    For example, the KV cache could be pre-allocated with the max sequence length, and you can use
-    cache_seqlens to keep track of the current sequence lengths of each sequence in the batch.
+    If k and v are not None, k_cache and v_cache will be updated *inplace* with
+    the new values from k and v. This is useful for incremental decoding: you
+    can pass in the cached keys/values from the previous step, and update them
+    with the new keys/values from the current step, and do attention with the
+    updated cache, all in 1 kernel.
 
-    Also apply rotary embedding if rotary_cos and rotary_sin are passed in. The key @k will be
-    rotated by rotary_cos and rotary_sin at indices cache_seqlens, cache_seqlens + 1, etc.
-    If causal or local (i.e., window_size != (-1, -1)), the query @q will be rotated by rotary_cos
-    and rotary_sin at indices cache_seqlens, cache_seqlens + 1, etc.
-    If not causal and not local, the query @q will be rotated by rotary_cos and rotary_sin at
-    indices cache_seqlens only (i.e. we consider all tokens in @q to be at position cache_seqlens).
+    EA: So by "update", I guess they mean "append to the list", right?
 
-    See tests/test_flash_attn.py::test_flash_attn_kvcache for examples of how to use this function.
+    If you pass in k / v, you must make sure that the cache is large enough to
+    hold the new values. For example, the KV cache could be pre-allocated with
+    the max sequence length, and you can use cache_seqlens to keep track of the
+    current sequence lengths of each sequence in the batch.
 
-    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
-    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
-    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
-    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+    Also apply rotary embedding if rotary_cos and rotary_sin are passed in. 
+    
+    - The key @k will be rotated by rotary_cos and rotary_sin at indices
+      cache_seqlens, cache_seqlens + 1, etc.
 
-    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
-    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+    EA: ^^ Only at those boundary indices, not in between?
+
+    - If causal or local (i.e., window_size != (-1, -1)), the query @q will be
+      rotated by rotary_cos and rotary_sin at indices cache_seqlens,
+      cache_seqlens + 1, etc.
+
+    EA: Evidently (causal || local) is equivalent to the window size not being
+    infinite? How is causal encoded in the window size? As (-1, 0)? Oh, no, (-1,
+    0) would be empty...query will be matched against keys counting from the
+    back
+               q        i <-> i - (|q| - |k|)        k
+                               +
+                         [-w_0 .. w_1]
+
+    Also note the minus sign on w[0], so both of them will typically be
+    non-negative, except for -1 which encodes "everything". So eg (1, 0) is
+    width-two window, (0, 1) is a width-two window
+
+    - If not causal and not local, the query @q will be rotated by rotary_cos
+      and rotary_sin at indices cache_seqlens only (i.e. we consider all tokens
+      in @q to be at position cache_seqlens).
+
+    See tests/test_flash_attn.py::test_flash_attn_kvcache for examples of how to
+    use this function.
+
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV
+    with fewer heads than Q. Note that the number of heads in Q must be
+    divisible by the number of heads in KV. For example, if Q has 6 heads and K,
+    V have 2 heads, head 0, 1, 2 of Q will attention to head 0 of K, V, and head
+    3, 4, 5 of Q will attention to head 1 of K, V.
+
+    EA: vvv What do they mean by seqlen_q and seqlen_k? Those aren't vars
+    anywhere...I guess `q.seqlen` and `k.seqlen_new`, and 
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the
+    attention matrix. For example, if seqlen_q = 2 and seqlen_k = 5, the causal
+    mask (1 = keep, 0 = masked out) is:
+
         1 1 1 1 0
-        1 1 1 1 1
-    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
-        0 0
-        0 0
-        0 0
-        1 0
-        1 1
-    If the row of the mask is all zero, the output will be zero.
 
-    If window_size != (-1, -1), implements sliding window local attention. Query at position i
-    will only attend to keys between
-    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+        1 1 1 1 1
+
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+
+        0 0
+
+        0 0
+
+        0 0
+
+        1 0
+
+        1 1
+    
+    EA: Why are they matched up at the end not the beginning?
+
+    If the row of the mask is all zero, the output will be zero.
 
     Note: Does not support backward pass.
 
     Arguments:
-        q: (batch_size, seqlen, nheads, headdim)
-        k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
-            or (num_blocks, page_block_size, nheads_k, headdim) if there's a block_table (i.e. paged KV cache)
-            page_block_size must be a multiple of 256.
-        v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
-            or (num_blocks, page_block_size, nheads_k, headdim) if there's a block_table (i.e. paged KV cache)
-        k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
-            k with k_cache, starting at the indices specified by cache_seqlens.
-        v [optional]: (batch_size, seqlen_new, nheads_k, headdim). Similar to k.
-        rotary_cos [optional]: (seqlen_ro, rotary_dim / 2). If not None, we apply rotary embedding
-            to k and q. Only applicable if k and v are passed in. rotary_dim must be divisible by 16.
-        rotary_sin [optional]: (seqlen_ro, rotary_dim / 2). Similar to rotary_cos.
-        cache_seqlens: int, or (batch_size,), dtype torch.int32. The sequence lengths of the
-            KV cache.
-        cache_batch_idx: (batch_size,), dtype torch.int32. The indices used to index into the KV cache.
-            If None, we assume that the batch indices are [0, 1, 2, ..., batch_size - 1].
-            If the indices are not distinct, and k and v are provided, the values updated in the cache
-                 might come from any of the duplicate indices.
-        cache_leftpad: (batch_size,), dtype torch.int32. The index that the KV cache starts. If None, assume 0.
-        block_table [optional]: (batch_size, max_num_blocks_per_seq), dtype torch.int32.
-        softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
-        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        softcap: float. Anything > 0 activates softcapping attention.
-        rotary_interleaved: bool. Only applicable if rotary_cos and rotary_sin are passed in.
-            If True, rotary embedding will combine dimensions 0 & 1, 2 & 3, etc. If False,
-            rotary embedding will combine dimensions 0 & rotary_dim / 2, 1 & rotary_dim / 2 + 1
-            (i.e. GPT-NeoX style).
-        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
-            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
-            is added to the attention score of query i and key j.
-        num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
-           If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
-           to automatically determine the number of splits.
-           Don't change this unless you know what you are doing.
-        return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
+    
+        q ~ (batch_size, seqlen, nheads, headdim)
+
+        k_cache ~ (batch_size_cache, seqlen_cache, nheads_k, headdim) 
+                        
+                        if there's no block_table, or 
+
+                ~ (num_blocks, page_block_size, nheads_k, headdim) 
+                        
+                        if there's a block_table (i.e. paged KV cache)
+                        page_block_size must be a multiple of 256.
+
+        v_cache: ~ (batch_size_cache, seqlen_cache, nheads_k, headdim) 
+                        
+                        if there's no block_table, or 
+
+                   (num_blocks, page_block_size, nheads_k, headdim) 
+
+                        if there's a block_table (i.e. paged KV cache)
+
+        k [optional] ~ (batch_size, seqlen_new, nheads_k, headdim). 
+        
+             If not None, we concatenate k with k_cache, starting at the indices
+             specified by cache_seqlens.
+
+        v [optional] ~ (batch_size, seqlen_new, nheads_k, headdim). 
+        
+             Similar to k.
+
+        rotary_cos [optional] ~ (seqlen_ro, rotary_dim / 2). 
+        
+             If not None, we apply rotary embedding to k and q. Only applicable
+             if k and v are passed in. rotary_dim must be divisible by 16.
+
+             EA: What is "rotary dim"?
+
+        rotary_sin [optional] ~ (seqlen_ro, rotary_dim / 2). 
+        
+             Similar to rotary_cos.
+
+        cache_seqlens: int, or (batch_size,), dtype torch.int32. 
+        
+             The sequence lengths of the KV cache.
+
+        cache_batch_idx: (batch_size,), dtype torch.int32. 
+        
+             The indices used to index into the KV cache. 
+             
+             If None, we assume that the batch indices are [0, 1, 2, ...,
+             batch_size - 1]. 
+             
+             If the indices are not distinct, and k and v are provided, the
+             values updated in the cache might come from any of the duplicate
+             indices.
+
+        cache_leftpad: (batch_size,), dtype torch.int32. 
+        
+            The index that the KV cache starts. If None, assume 0.
+
+        block_table [optional] ~ (batch_size, max_num_blocks_per_seq), dtype
+        torch.int32.
+
+        softmax_scale: float 
+        
+             The scaling of QK^T before applying softmax. Default to 1 /
+             sqrt(headdim)
+
+        causal: bool
+        
+            Whether to apply causal attention mask (e.g., for auto-regressive
+            modeling).
+
+        window_size: (left, right) 
+        
+            If not (-1, -1), implements sliding window local attention.
+
+        softcap: float 
+        
+            Anything > 0 activates softcapping attention.
+
+        rotary_interleaved: bool 
+        
+            Only applicable if rotary_cos and rotary_sin are passed in. 
+            
+            If True, rotary embedding will combine dimensions 0 & 1, 2 & 3, etc. 
+          
+            If False, rotary embedding will combine dimensions 0 & rotary_dim /
+            2, 1 & rotary_dim / 2 + 1 (i.e. GPT-NeoX style).
+
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32 
+        
+            A bias of (-alibi_slope * |i + seqlen_k - seqlen_q - j|) is added to
+            the attention score of query i and key j.
+
+        num_splits: int 
+        
+            If > 1, split the key/value into this many chunks along the
+            sequence. 
+            
+            If num_splits == 1, we don't split the key/value. 
+            
+            If num_splits == 0, we use a heuristic to automatically determine
+            the number of splits. 
+            
+            Don't change this unless you know what you are doing.
+
+        return_softmax_lse: bool 
+        
+            Whether to return the logsumexp of the attention scores.
 
     Return:
-        out: (batch_size, seqlen, nheads, headdim).
-        softmax_lse [optional, if return_softmax_lse=True]: (batch_size, nheads, seqlen). The
-            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
-    """
 
+        out ~ (batch_size, seqlen, nheads, headdim)
+
+        softmax_lse [optional, if return_softmax_lse=True] 
+        
+            ~ (batch_size, nheads, seqlen). 
+            
+            The logsumexp of each row of the matrix QK^T * scaling (e.g., log of
+            the softmax normalization factor).
+    """
+    #
+    # EA: vvv This is interesting, what does this accomplish? It seems like if
+    # the user passed in any of these keyword arguments it would still result in
+    # an error since they're not in the signature
+    #
     # unimplemented kwargs
     k = None
     v = None

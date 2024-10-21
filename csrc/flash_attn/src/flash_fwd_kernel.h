@@ -492,13 +492,48 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
-inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
-
+template<
+  typename Kernel_traits, 
+  bool Is_causal, 
+  bool Is_local, 
+  bool Has_alibi, 
+  bool Is_even_MN, 
+  bool Is_even_K, 
+  bool Is_softcap, 
+  bool Split, 
+  bool Append_KV, 
+  typename Params
+>
+inline __device__ void 
+compute_attn_1rowblock_splitkv(
+  const Params &params,
+  // 
+  // Kcache ~ (B, ((bN, bN'), s'), H, Z)
+  // 
+  // I think
+  //         bidb is cB, the batch coordinate
+  //         bidh is cH, the head  coordinate
+  //      m_block is cm', the coordinate of the block of Q's we're local to
+  //  n_split_idx is cs', the coordinate of the current split
+  // num_n_splits is s'
+  // 
+  // Below
+  // 
+  // n_blocks_per_split is bN'
+  //            kBlockN is bN
+  // 
+  const int bidb,
+  const int bidh,
+  const int m_block,
+  const int n_split_idx,
+  const int num_n_splits)
+{
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
-
+    // 
+    // EA: Is this vvv a bit weird in a __device__ function?
+    // 
     // Shared memory.
     extern __shared__ char smem_[];
 
@@ -509,42 +544,124 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNWarps = Kernel_traits::kNWarps;
-
+    //
+    // So I think these vvv would be on the CM::in FA3
+    //
     using GmemTiledCopyO = std::conditional_t<
         !Split,
         typename Kernel_traits::GmemTiledCopyO,
         typename Kernel_traits::GmemTiledCopyOaccum
     >;
     using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
-
+//                                                                                                  BlockInfo/ctor
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
+    // 
+    // EA: ^^^ Note it doesn't ask for bidh or m_block
+    // 
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("Is_even_MN = %d, is_cumulativ = %d, seqlen_k_cache = %d, actual_seqlen_k = %d\n", Is_even_MN, params.is_seqlens_k_cumulative, binfo.seqlen_k_cache, binfo.actual_seqlen_k); }
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
-
-    const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
+    //
+    // I think n_blocks_per_split is bN'
+    //
+    // I guess the (a + b - 1) / b pattern just achieves ceil_div(a, b), so this
+    // is just two rounds of ceil div
+    //
+    const int n_blocks_per_split = 
+      (   (params.seqlen_k + kBlockN - 1) 
+        / kBlockN 
+        + num_n_splits 
+        - 1) 
+      / num_n_splits;
+    //
+    // It's easier to look first at the n_block_max; the n_block_min is then a
+    // special case. Assuming we're either causal or local, the n_block_max is
+    // the min of three values:
+    // 1. actual_seqlen_k /^ kBlockN
+    //    - This is the total number of blocks of the kv cache
+    // 2. (n_split_idx + 1) * n_blocks_per_split
+    //    - This is the idx of the least block that would overflow the current
+    //      split
+    // 3. (If causal or local)   
+    // 
+    /*      (m_block + 1) * kBlockM
+    //    + (actual_seqlen_k - actual_seqlen_q)
+    //    + window_size_right
+    */
+    //    - This is the least k-index which would overflow the window. The first
+    //      term, (m_block + 1) * kBlockM, is the first q that would overflow
+    //      this block. Then you add (seq_k - seq_q) because you match the q's
+    //      against the k's starting from the end of each, so this gives the k
+    //      matching the first q which would overflow this block. (I guess you
+    //      don't start the window until you get out of the current m-block.)
+    //      Now you add the window size, and evidently it's inclusive.
+    //
+    // Now the symmetric thing is true for finding n_block_min, just that we
+    // know the least block in the kv cache is zero, so 1 above is trivial.
+    //
     const int n_block_min = !Is_local
         ? n_split_idx * n_blocks_per_split
-        : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
-    int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
+        : std::max(
+          n_split_idx * n_blocks_per_split, 
+          (   m_block * kBlockM 
+            + (binfo.actual_seqlen_k - binfo.actual_seqlen_q)
+            - params.window_size_left
+          ) / kBlockN);
+    int n_block_max = std::min(
+      cute::ceil_div(
+        binfo.actual_seqlen_k, 
+        kBlockN), 
+      (n_split_idx + 1) * n_blocks_per_split);
     if (Is_causal || Is_local) {
-        n_block_max = std::min(n_block_max,
-                               cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
+        n_block_max = std::min(
+          n_block_max,
+          cute::ceil_div(
+            (m_block + 1) * kBlockM 
+              + binfo.actual_seqlen_k 
+              - binfo.actual_seqlen_q 
+              + params.window_size_right, 
+            kBlockN));
     }
+//                                                                                               if (early return)
     if (n_block_min >= n_block_max) {  // This also covers the case where n_block_max <= 0
         // We exit early and write 0 to gOaccum and -inf to gLSEaccum.
-        // Otherwise we might read OOB elements from gK and gV,
-        // or get wrong results when we combine gOaccum from different blocks.
-        const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
-            + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
-        const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
-            + m_block * kBlockM) * params.d_rounded;
-        const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
-        Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
-                                      Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                     make_stride(Split ? kHeadDim : params.o_row_stride, _1{}));
-        Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
-                                      Shape<Int<kBlockM>>{}, Stride<_1>{});
+        //
+        // Otherwise we might read OOB elements from gK and gV, or get wrong
+        // results when we combine gOaccum from different blocks.
+        const index_t row_offset_o = 
+            binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
+          + m_block * kBlockM * params.o_row_stride 
+          + bidh * params.o_head_stride;
+        const index_t row_offset_oaccum = 
+          (
+              (   (n_split_idx * params.b + bidb) 
+                * params.h 
+                + bidh
+              ) * params.seqlen_q
+            + m_block * kBlockM) 
+          * params.d_rounded;
+        const index_t row_offset_lseaccum =
+          (
+              (n_split_idx * params.b + bidb) * params.h 
+            + bidh
+          )
+          * params.seqlen_q 
+          + m_block * kBlockM;
+        Tensor gOaccum = make_tensor(
+          make_gmem_ptr(
+              reinterpret_cast<
+                ElementO *
+              >   (Split ? params.oaccum_ptr : params.o_ptr) 
+                + (Split ? row_offset_oaccum : row_offset_o)),
+          Shape<Int<kBlockM>, Int<kHeadDim>>{},
+          make_stride(Split ? kHeadDim : params.o_row_stride, _1{}));
+        Tensor gLSEaccum = make_tensor(
+          make_gmem_ptr(
+              reinterpret_cast<
+                ElementAccum *
+              >(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) 
+            + row_offset_lseaccum),
+          Shape<Int<kBlockM>>{}, Stride<_1>{});
 
         GmemTiledCopyO gmem_tiled_copy_Oaccum;
         auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
@@ -552,64 +669,162 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor tOrOaccum = make_tensor<ElementO>(shape(tOgOaccum));
         clear(tOrOaccum);
         // Construct identity layout for sO
-        Tensor cO = make_identity_tensor(make_shape(size<0>(gOaccum), size<1>(gOaccum)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+        Tensor cO = make_identity_tensor(
+          make_shape(
+            size<0>(gOaccum), 
+            size<1>(gOaccum)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
         // Repeat the partitioning with identity layouts
         Tensor tOcO = gmem_thr_copy_Oaccum.partition_D(cO);
         Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
         if (!Is_even_K) {
             #pragma unroll
-            for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+            for (int k = 0; k < size(tOpO); ++k) { 
+              tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d;
+            }
         }
         // Clear_OOB_K must be false since we don't want to write zeros to gmem
-        flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+        flash::copy<
+          Is_even_MN, 
+          Is_even_K, 
+          /*Clear_OOB_MN=*/false, 
+          /*Clear_OOB_K=*/false
+        >(
+            gmem_tiled_copy_Oaccum, 
+            tOrOaccum, 
+            tOgOaccum, 
+            tOcO, 
+            tOpO, 
+            binfo.actual_seqlen_q - m_block * kBlockM
         );
         #pragma unroll
         for (int m = 0; m < size<1>(tOgOaccum); ++m) {
             const int row = get<0>(tOcO(0, m, 0));
-            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSEaccum(row) = Split ? -INFINITY : INFINITY; }
+            if (  row < 
+                          binfo.actual_seqlen_q 
+                        - m_block * kBlockM 
+                && get<1>(tOcO(0, m, 0)) == 0) 
+            { gLSEaccum(row) = Split ? -INFINITY : INFINITY; }
         }
         return;
+//                                                                                              /if (early return)
     }
-
-    // We iterate over the blocks in reverse order. This is because the last block is the only one
-    // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
-    // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
-
+//                                                                                          Move K,V to last block
+    // We iterate over the blocks in reverse order. This is because the last
+    // block is the only one that needs masking when we read K and V from global
+    // memory. Moreover, iterating in reverse might save us 1 register (we just
+    // need n_block instead of both n_block and n_block_max).
+    //
+    // EA: vvv Wouldn't we expect to put them beyond the last block in use,
+    // since we need to copy in all the new K's and V's?
+    //
     // We move K and V to the last block.
-    const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
-    const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
-    const int block_table_idx = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN / params.page_block_size;
-    const int block_table_offset = block_table == nullptr ? 0 : (n_block_max - 1) * kBlockN - block_table_idx * params.page_block_size;
-    const index_t row_offset_k = block_table == nullptr
-        ? binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
-          + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
-        : block_table[block_table_idx] * params.k_batch_stride + block_table_offset * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride;
-    const index_t row_offset_v = block_table == nullptr
-        ? binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
-          + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
-        : block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
+    const int bidb_cache = 
+        params.cache_batch_idx == nullptr 
+      ? bidb 
+      : params.cache_batch_idx[bidb];
+    //
+    // This vvv advances the block table to the "row" of logical pages relevant
+    // to cB, the current batch element
+    //
+    const int *block_table = 
+        params.block_table == nullptr
+      ? 
+        nullptr 
+      : 
+          params.block_table 
+        + bidb                          * params.block_table_batch_stride;
+    //
+    // Note bN != page_block_size. I don't know if one has to divide the other.
+    // In FA2/flash_api it does require that the page size be divisible by 256,
+    // so that would make it likely that bN divides it.
+    //
+    // Now vvv we want to move which logical page in the row we're looking at.
+    // We get the kv-row index which sits at the beginning of the last block
+    // this kernel cares about (ie (n_block_max - 1) * bN) and jump over the
+    // right number of logical pages to get to the page containing it (ie the
+    // last page, assuming bN divides page_block_size)
+    //
+    const int block_table_idx = 
+        block_table == nullptr 
+      ? 
+        0 
+      : 
+        (n_block_max - 1) * kBlockN / params.page_block_size;
 
-    Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
-                            make_shape(binfo.actual_seqlen_q, params.h, params.d),
-                            make_stride(params.q_row_stride, params.q_head_stride, _1{}));
-    Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                           make_coord(m_block, 0));  // (kBlockM, kHeadDim)
-    Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr) + row_offset_k),
-                            Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                            make_stride(params.k_row_stride, _1{}));
+    const int block_table_offset = 
+        block_table == nullptr 
+      ? 
+        0 
+      : 
+          (n_block_max - 1)             * kBlockN 
+        - block_table_idx               * params.page_block_size;
+    //
+    // This ^^^ is effectively (x * bN) - ((x * bN) / page_size) * page_size, so
+    // getting the offset between the start of the page and the start of the
+    // last block (assuming block size divides page size), in units of kv-rows
+    //
+    // So this vvv seems on the surface only to move them to the end, not beyond
+    // the end
+    //
+    const index_t row_offset_k = 
+          block_table == nullptr
+        ?   
+            binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
+          + (n_block_max - 1) * kBlockN  * params.k_row_stride 
+          + (bidh / params.h_h_k_ratio)  * params.k_head_stride
+        :
+            block_table[block_table_idx] * params.k_batch_stride 
+          + block_table_offset           * params.k_row_stride 
+          + (bidh / params.h_h_k_ratio)  * params.k_head_stride;
+
+    const index_t row_offset_v = 
+        block_table == nullptr
+        ?   
+            binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
+          + (n_block_max - 1) * kBlockN  * params.v_row_stride 
+          + (bidh / params.h_h_k_ratio)  * params.v_head_stride
+        :   
+            block_table[block_table_idx] * params.v_batch_stride 
+          + block_table_offset           * params.v_row_stride 
+          + (bidh / params.h_h_k_ratio)  * params.v_head_stride;
+
+    Tensor mQ = make_tensor(
+      make_gmem_ptr(
+          reinterpret_cast<Element*>(params.q_ptr) 
+        + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
+      make_shape(binfo.actual_seqlen_q, params.h, params.d),
+      make_stride(params.q_row_stride, params.q_head_stride, _1{}));
+
+    Tensor gQ = local_tile(
+      mQ(_, bidh, _), 
+      Shape<Int<kBlockM>, Int<kHeadDim>>{},
+      make_coord(m_block, 0));
+
+    Tensor gK = make_tensor(
+      make_gmem_ptr(
+          reinterpret_cast<Element *>(params.k_ptr) 
+        + row_offset_k),
+      Shape<
+        Int<kBlockN>, 
+        Int<kHeadDim>
+      >{},
+      make_stride(params.k_row_stride, _1{}));
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("k_ptr = %p, row_offset_k = %d, gK_ptr = %p\n", params.k_ptr, row_offset_k, gK.data()); }
-    Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) + row_offset_v),
-                            Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                            make_stride(params.v_row_stride, _1{}));
+    Tensor gV = make_tensor(
+      make_gmem_ptr(
+          reinterpret_cast<Element *>(params.v_ptr) 
+        + row_offset_v),
+      Shape<Int<kBlockN>, Int<kHeadDim>>{},
+      make_stride(params.v_row_stride, _1{}));
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
     Tensor sK = make_tensor(sQ.data() + size(sQ), typename Kernel_traits::SmemLayoutKV{});
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
-    Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
-
+    Tensor sVtNoSwizzle = make_tensor(
+      sV.data().get(), 
+      typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
 
@@ -626,7 +841,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
 
-    Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
+    Tensor acc_o = partition_fragment_C(
+      tiled_mma, 
+      Shape<Int<kBlockM>, 
+      Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
 
     //
     // Copy Atom retiling
@@ -652,12 +870,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // Tensor tKVpKV = make_tensor<bool>(make_shape(size<1>(tKsK), size<2>(tKsK)), Stride<_1,_0>{});
 
     // Construct identity layout for sQ and sK
-    Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
-    Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));    // (BLK_N,BLK_K) -> (blk_n,blk_k)
+    Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));//       (BLK_M,BLK_K) -> (blk_m,blk_k)
+    Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));//      (BLK_N,BLK_K) -> (blk_n,blk_k)
 
     // Repeat the partitioning with identity layouts
-    Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
-    Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);   // (BCPY,BCPY_N,BCPY_K) -> (blk_n,blk_k)
+    Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);//                       (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
+    Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);//                    (BCPY,BCPY_N,BCPY_K) -> (blk_n,blk_k)
 
     // Allocate predicate tensors for k
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
@@ -666,161 +884,409 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // Set predicates for k bounds
     if (!Is_even_K) {
         #pragma unroll
-        for (int k = 0; k < size(tQpQ); ++k) { tQpQ(k) = get<1>(tQcQ(0, 0, k)) < params.d; }
+        for (int k = 0; k < size(tQpQ); ++k) { 
+          tQpQ(k) = get<1>(tQcQ(0, 0, k)) < params.d; 
+        }
         #pragma unroll
-        for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
+        for (int k = 0; k < size(tKVpKV); ++k) { 
+          tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; 
+        }
     }
 
     // Prologue
+//                                                                                                    make Cos,Sin
+    /*
+    From kernel_traits:
 
+    using GmemTiledCopyRotcossin = decltype(
+        make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, Element>{},
+                        GmemLayoutAtomRotcossin{},
+                        Layout<Shape < _1, _4>>{}));  // Val layout, 4 vals per load
+    using GmemTiledCopyRotcossinCont = decltype(
+        make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
+                        GmemLayoutAtomRotcossin{},
+                        Layout<Shape < _1, _8>>{}));  // Val layout, 8 vals per load
+    */
     // Copy from Knew to K, optionally apply rotary embedding.
     typename Kernel_traits::GmemTiledCopyRotcossin gmem_tiled_copy_rotary;
     auto gmem_thr_copy_rotary = gmem_tiled_copy_rotary.get_thread_slice(tidx);
     typename Kernel_traits::GmemTiledCopyRotcossinCont gmem_tiled_copy_rotary_cont;
     auto gmem_thr_copy_rotary_cont = gmem_tiled_copy_rotary_cont.get_thread_slice(tidx);
+//                                                                                                  if (Append_KV)
+    // This if clause ends on ~1176
     if constexpr (Append_KV) {
-        // Even if we have MQA / GQA, all threadblocks responsible for the same KV head are writing to
-        // gmem. Technically it's a race condition, but they all write the same content anyway, and it's safe.
-        // We want to do this so that all threadblocks can proceed right after they finish writing the KV cache.
-        const index_t row_offset_cossin = ((n_block_max - 1) * kBlockN + (params.leftpad_k == nullptr ? 0 : params.leftpad_k[bidb])) * (params.rotary_dim / 2);
-        Tensor gCos = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
-                                  Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
-                                  make_stride(params.rotary_dim / 2, _1{}));
-        Tensor gSin = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
-                                  Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
-                                  make_stride(params.rotary_dim / 2, _1{}));
-        Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
-                                      Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                                      make_stride(params.rotary_dim / 2, _1{}));
-        Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
-                                      Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                                      make_stride(params.rotary_dim / 2, _1{}));
-        Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
-        Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
+        //
+        // EA: That's vvv a fun optimization
+        //
+        // Even if we have MQA / GQA, all threadblocks responsible for the same
+        // KV head are writing to gmem. Technically it's a race condition, but
+        // they all write the same content anyway, and it's safe.
+        //
+        // We want to do this so that all threadblocks can proceed right after
+        // they finish writing the KV cache.
+        //
+        // EA: So this ^^^ means you only have to call __syncthreads at the end
+        // of the loop over blocks, not something stronger
+        //
+        const index_t row_offset_cossin =
+              (
+                  (n_block_max - 1) * kBlockN 
+                + ( params.leftpad_k == nullptr//  |
+                    ? 0                        //  | padding offset
+                    : params.leftpad_k[bidb])) //  |
+            * (params.rotary_dim / 2);
+        //
+        // Note that gSin uses the same offset, so there's no row_offset_sin
+        //
+        // I guess the Cutlass-y name for params.rotary_cos_ptr would be mCos
+        //
+        // Note the difference in the Cont and non-Cont tensors...
+        //
+        //     Cont    ~ (bN, hdim)     : (rotary_dim / 2, 1)
+        //
+        //     nonCont ~ (bN, hdim / 2) : (rotary_dim / 2, 1)
+        //
+        // So evidently I should think of the latter as a subtile of the former?
+        //
+        Tensor gCos = make_tensor(
+          make_gmem_ptr(
+              reinterpret_cast<Element *>(params.rotary_cos_ptr)
+            + row_offset_cossin),
+          Shape<Int<kBlockN>, Int<kHeadDim / 2>>{},
+          make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gSin = make_tensor(
+          make_gmem_ptr(
+              reinterpret_cast<Element *>(params.rotary_sin_ptr) 
+            + row_offset_cossin),
+          Shape<
+            Int<kBlockN>, 
+            Int<kHeadDim / 2>
+          >{},
+          make_stride(params.rotary_dim / 2, _1{}));
+        Tensor gCosCont = make_tensor(
+          make_gmem_ptr(
+              reinterpret_cast<Element *>(params.rotary_cos_ptr) 
+            + row_offset_cossin),
+          Shape<
+            Int<kBlockN>, 
+            Int<kHeadDim>
+          >{},
+          make_stride(
+            params.rotary_dim / 2, 
+            _1{}));
+        Tensor gSinCont = make_tensor(
+          make_gmem_ptr(
+              reinterpret_cast<Element *>(params.rotary_sin_ptr) 
+            + row_offset_cossin),
+          Shape<
+            Int<kBlockN>, 
+            Int<kHeadDim>
+          >{},
+          make_stride(
+            params.rotary_dim / 2, 
+            _1{}));
+        Tensor tRgCos     = gmem_thr_copy_rotary.     partition_S(gCos);
+        Tensor tRgSin     = gmem_thr_copy_rotary.     partition_S(gSin);
         Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
         Tensor tRgSinCont = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
         // if (cute::thread(0, 0)) { printf("rotary_cos_ptr = %p, gCos.data() = %p, tRgCos.data() = %p, rotary_dim = %d\n", params.rotary_cos_ptr, gCos.data(), tRgCos.data(), params.rotary_dim); }
         // if (cute::thread(8, 0)) { print_tensor(gCos); }
         // if (cute::thread(0, 0)) { print_tensor(tRgCos); }
-
-        // const index_t row_offset_knew = binfo.k_offset(params.knew_batch_stride, params.knew_row_stride, bidb)
-        const index_t row_offset_knew = bidb * params.knew_batch_stride
-            + ((n_block_max - 1) * kBlockN) * params.knew_row_stride + (bidh / params.h_h_k_ratio) * params.knew_head_stride;
+//                                                                                                  make g{K,V}new
+        /* const index_t row_offset_knew = binfo.k_offset(params.knew_batch_stride, params.knew_row_stride, bidb)
+        */ 
+        // EA: vvv the first row in the last block relevant to this cB and cH
+        //
+        const index_t row_offset_knew = 
+            bidb                           * params.knew_batch_stride
+          + ((n_block_max - 1) * kBlockN)  * params.knew_row_stride 
+          + (bidh / params.h_h_k_ratio)    * params.knew_head_stride;
         // const index_t row_offset_vnew = binfo.k_offset(params.vnew_batch_stride, params.vnew_row_stride, bidb)
-        const index_t row_offset_vnew = bidb * params.vnew_batch_stride
-            + ((n_block_max - 1) * kBlockN) * params.vnew_row_stride + (bidh / params.h_h_k_ratio) * params.vnew_head_stride;
-        // Subtract seqlen_k_cache * row stride so that conceptually gK and gKnew "line up". When we access them,
-        // e.g. if gK has 128 rows and gKnew has 64 rows, we access gK[:128] and gKNew[128:128 + 64].
+        const index_t row_offset_vnew = 
+            bidb                           * params.vnew_batch_stride
+          + ((n_block_max - 1) * kBlockN)  * params.vnew_row_stride 
+          + (bidh / params.h_h_k_ratio)    * params.vnew_head_stride;
+        // 
+        // Subtract seqlen_k_cache * row stride so that conceptually gK and
+        // gKnew "line up". When we access them, e.g. if gK has 128 rows and
+        // gKnew has 64 rows, we access gK[:128] and gKNew[128:128 + 64].
+        // 
         // This maps to accessing the first 64 rows of knew_ptr.
-        Tensor gKnew = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.knew_ptr)
-                                                + row_offset_knew - binfo.seqlen_k_cache * params.knew_row_stride),
-                                  Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                                  make_stride(params.knew_row_stride, _1{}));
+        Tensor gKnew = make_tensor(
+          make_gmem_ptr(
+              reinterpret_cast<Element *>(params.knew_ptr)
+            + row_offset_knew 
+            - binfo.seqlen_k_cache * params.knew_row_stride),
+        //
+        // ^^^ I conjecture that seqlen_k_cache is the length of the portion of
+        // the kv cache (in units of kv rows) that is relevant to this cB. (Not
+        // "...and cH" bcs block info doesn't know about cH.)
+        //
+          Shape<
+            Int<kBlockN>, 
+            Int<kHeadDim>
+          >{},
+          make_stride(
+            params.knew_row_stride, 
+            _1{}));
         // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("knew_ptr = %p, row_offset_knew = %d, gKnew_ptr = %p\n", params.knew_ptr, row_offset_knew, gKnew.data()); }
-        Tensor gVnew = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.vnew_ptr)
-                                                + row_offset_vnew - binfo.seqlen_k_cache * params.vnew_row_stride),
-                                  Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                                  make_stride(params.vnew_row_stride, _1{}));
+        Tensor gVnew = make_tensor(
+          make_gmem_ptr(
+              reinterpret_cast<Element *>(params.vnew_ptr)
+            + row_offset_vnew 
+            - binfo.seqlen_k_cache * params.vnew_row_stride),
+            Shape<
+              Int<kBlockN>, 
+              Int<kHeadDim>
+            >{},
+            make_stride(
+              params.vnew_row_stride, 
+              _1{}));
         Tensor tKgKnew = gmem_thr_copy_QKV.partition_S(gKnew);  // (KCPY, KCPY_N, KCPY_K)
         Tensor tVgVnew = gmem_thr_copy_QKV.partition_S(gVnew);  // (VCPY, VCPY_N, VCPY_K)
 
         const int n_block_copy_min = std::max(n_block_min, binfo.seqlen_k_cache / kBlockN);
+//                                                                                            Store old tKgK, tVgV
         auto tKgK_data = tKgK.data();
         auto tVgV_data = tVgV.data();
+        //
+        // EA: Is this ^^^ storing the the very end location? Well, it should be
+        // the start of the last block, right?
+//                                                                                   for (backward over kv blocks)
         for (int n_block = n_block_max - 1; n_block >= n_block_copy_min; n_block--) {
+//                                                                         Copy the new V's to the cache w no RoPE
+            //
+            // NB this one vvv is not inside an if clause
+            //
+            // This fcn is in csrc/flash_attn/src/utils.h, line 366, basically
+            // it just wraps the copy(S(_, m, k), D(_, m, k)) inside an if
+            // clause with predicate identity_MN(0, m, 0) is in [min_MN ..
+            // max_MN)
+            //
+            // OK, so I conjecture this is copying all the new V's
+            //
             flash::copy_w_min_idx<Is_even_K>(
-                tVgVnew, tVgV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN, binfo.seqlen_k_cache - n_block * kBlockN
+                tVgVnew, //                                     ->            S
+                tVgV, //                                        ->            D
+                tKVcKV, //                                      ->            identity_MN
+                tKVpKV, //                                      ->            predicate_K
+                binfo.actual_seqlen_k - n_block * kBlockN, //   -> int const  max_MN
+                binfo.seqlen_k_cache - n_block * kBlockN  //    -> int const  min_MN 
             );
-            tVgVnew.data() = tVgVnew.data() + (-int(kBlockN * params.vnew_row_stride));
+            // Why move this pointer? Are you going to use it again? Oh yes, of
+            // course, you're going to use it in the next iteration 
+//                                                                                          Move tVgVnew backwards
+            tVgVnew.data() = tVgVnew.data() + (-int(  kBlockN     * params.vnew_row_stride));
+//                                                                            Copy the new K's to the cache w RoPE
             if (params.rotary_dim == 0) {
                 flash::copy_w_min_idx<Is_even_K>(
-                    tKgKnew, tKgK, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN, binfo.seqlen_k_cache - n_block * kBlockN
+                    tKgKnew,//                                                 -> S
+                    tKgK,   //                                                 -> D
+                    tKVcKV, 
+                    tKVpKV, 
+                    binfo.actual_seqlen_k -            n_block    * kBlockN,// -> max_MN
+                    binfo.seqlen_k_cache -             n_block    * kBlockN // -> min_MN
                 );
             } else {
                 if (params.is_rotary_interleaved) {
                     // Don't clear OOB_K because we're writing to global memory
-                    flash::copy_rotary_interleaved<Is_even_K, /*Clear_OOB_K=*/false>(
-                        tKgKnew, tKgK, tRgCos, tRgSin, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
-                        binfo.seqlen_k_cache - n_block * kBlockN, params.d, params.rotary_dim
+                    flash::copy_rotary_interleaved<
+                      Is_even_K, 
+                      /*Clear_OOB_K=*/false
+                    >(
+                        tKgKnew,                                              // -> S
+                        tKgK,//                                                  -> D
+                        tRgCos,//                                                ->
+                        tRgSin,//                                                ->
+                        tKVcKV,//                                                -> identity_MN
+                        binfo.actual_seqlen_k -         n_block   * kBlockN,//   -> max_MN
+                        binfo.seqlen_k_cache -          n_block   * kBlockN,//   -> min_MN
+                        params.d, //                                             -> dim
+                        params.rotary_dim                                     // -> rotary_dim
                     );
+
                     tRgCos.data() = tRgCos.data() + (-int(kBlockN * params.rotary_dim / 2));
                     tRgSin.data() = tRgSin.data() + (-int(kBlockN * params.rotary_dim / 2));
                 } else {
                     // Don't clear OOB_K because we're writing to global memory
-                    flash::copy_rotary_contiguous<Is_even_K, /*Clear_OOB_K=*/false>(
-                        tKgKnew, tKgK, tRgCosCont, tRgSinCont, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
-                        binfo.seqlen_k_cache - n_block * kBlockN, params.d, params.rotary_dim
+                    flash::copy_rotary_contiguous<
+                      Is_even_K,
+                      /*Clear_OOB_K=*/false
+                    >(
+                        tKgKnew, 
+                        tKgK, 
+                        tRgCosCont, 
+                        tRgSinCont, 
+                        tKVcKV, 
+                        binfo.actual_seqlen_k  -       n_block    * kBlockN,
+                        binfo.seqlen_k_cache   -       n_block    * kBlockN, 
+                        params.d, 
+                        params.rotary_dim
                     );
                     tRgCosCont.data() = tRgCosCont.data() + (-int(kBlockN * params.rotary_dim / 2));
                     tRgSinCont.data() = tRgSinCont.data() + (-int(kBlockN * params.rotary_dim / 2));
-
                 }
             }
+//                                                                                          Move tKgKnew backwards
             tKgKnew.data() = tKgKnew.data() + (-int(kBlockN * params.knew_row_stride));
             if (block_table == nullptr) {
-                tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                // Move tKgK and tVgV backward by one block, for iteration
+                // purposes. (But you're doing this and also deccrementing the
+                // loop var n_block? Seems weird to do both.)
+                tVgV.data() = tVgV.data() +    (-int(  kBlockN    * params.v_row_stride));
+                tKgK.data() = tKgK.data() +    (-int(  kBlockN    * params.k_row_stride));
             } else {
                 if (n_block > n_block_copy_min) {
+                    // 
+                    // vvv The logical page that the current n_block value falls on
+                    // 
                     const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
-                    const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
+                    //
+                    // vvv The number of kv rows beyond the start of the logical
+                    // page that the current n_block value puts us
+                    //
+                    const int block_table_offset_cur = 
+                        n_block              * kBlockN 
+                      - block_table_idx_cur  * params.page_block_size;
+                    //
+                    // The next block will put us at a lower (log_page, rows
+                    // forward) pair lexicographically
+                    //
                     const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
-                    const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
+
+                    const int block_table_offset_next = 
+                        (n_block - 1)        * kBlockN 
+                      - block_table_idx_next * params.page_block_size;
+                    //
+                    // next - current should be negative, although it depends
+                    // how you're allocating pages
+                    //
                     const int table_diff = block_table[block_table_idx_next] - block_table[block_table_idx_cur];
                     const int offset_diff = block_table_offset_next - block_table_offset_cur;
-                    tVgV.data() = tVgV.data() + table_diff * params.v_batch_stride + offset_diff * params.v_row_stride;
-                    tKgK.data() = tKgK.data() + table_diff * params.k_batch_stride + offset_diff * params.k_row_stride;
+//                                                                                    Move tVgV and tKgK backwards
+                    tVgV.data() = 
+                        tVgV.data() 
+                      + table_diff           * params.v_batch_stride 
+                      + offset_diff          * params.v_row_stride;
+                    tKgK.data() = 
+                        tKgK.data() 
+                      + table_diff           * params.k_batch_stride 
+                      + offset_diff          * params.k_row_stride;
                 }
             }
+//                                                                                  /for (backward over kv blocks)
         }
-        // Need this before we can read in K again, so that we'll see the updated K values.
+//                                                                                                reset tKgK, tVgV
+
+        // Need this before we can read in K again, so that we'll see the
+        // updated K values.
         __syncthreads();
         tKgK.data() = tKgK_data;
         tVgV.data() = tVgV_data;
+//                                                                                                 /if (Append_KV)
     }
-
+//                                                                                                 Apply Rope to Q
     // Read Q from gmem to smem, optionally apply rotary embedding.
     if (!Append_KV || params.rotary_dim == 0) {
         // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
-        flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
-                                           binfo.actual_seqlen_q - m_block * kBlockM);
+        flash::copy<Is_even_MN, Is_even_K>(
+          gmem_tiled_copy_QKV, 
+          tQgQ,
+          tQsQ,
+          tQcQ,
+          tQpQ,
+          binfo.actual_seqlen_q - m_block * kBlockM);
     } else {
-        const index_t row_offset_cossin = (binfo.seqlen_k_cache + (params.leftpad_k == nullptr ? 0 : params.leftpad_k[bidb]) + (Is_causal || Is_local ? m_block * kBlockM : 0)) * (params.rotary_dim / 2);
-        // If not causal, all the queries get the same the cos/sin, taken at location seqlen_k_cache.
+        const index_t row_offset_cossin = 
+          (   binfo.seqlen_k_cache 
+            + (
+                params.leftpad_k == nullptr 
+                ? 0 
+                : params.leftpad_k[bidb]) 
+            + (
+                Is_causal || Is_local 
+                ? m_block * kBlockM 
+                : 0)) 
+          * (params.rotary_dim / 2);
+        // 
+        // EA: vvv Huh?
+        // 
+        // If not causal, all the queries get the same the cos/sin, taken at
+        // location seqlen_k_cache.
+        //
         // We do this by setting the row stride of gCos / gSin to 0.
-        Tensor gCos = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
-                                  Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
-                                  make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
-        Tensor gSin = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
-                                  Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
-                                  make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
-        Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_cos_ptr) + row_offset_cossin),
-                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                  make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
-        Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.rotary_sin_ptr) + row_offset_cossin),
-                                  Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                  make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
+        Tensor gCos = make_tensor(
+          make_gmem_ptr(
+              reinterpret_cast<Element *>(params.rotary_cos_ptr) 
+            + row_offset_cossin),
+            Shape<Int<kBlockM>, Int<kHeadDim / 2>>{},
+            make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
+        Tensor gSin = make_tensor(
+          make_gmem_ptr(
+              reinterpret_cast<Element *>(params.rotary_sin_ptr) 
+            + row_offset_cossin),
+          Shape<
+            Int<kBlockM>, 
+            Int<kHeadDim / 2>
+          >{},
+          make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
+        Tensor gCosCont = make_tensor(
+          make_gmem_ptr(
+              reinterpret_cast<Element *>(params.rotary_cos_ptr) 
+            + row_offset_cossin),
+          Shape<Int<kBlockM>, Int<kHeadDim>>{},
+          make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
+        Tensor gSinCont = make_tensor(
+          make_gmem_ptr(
+              reinterpret_cast<Element *>(params.rotary_sin_ptr) 
+            + row_offset_cossin),
+            Shape<
+              Int<kBlockM>, 
+              Int<kHeadDim>
+            >{},
+            make_stride(Is_causal || Is_local ? params.rotary_dim / 2 : 0, _1{}));
         Tensor tRgCos = gmem_thr_copy_rotary.partition_S(gCos);
         Tensor tRgSin = gmem_thr_copy_rotary.partition_S(gSin);
         Tensor tRgCosCont = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
         Tensor tRgSinCont = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
         if (params.is_rotary_interleaved) {
+//                                                                                         copy Q gs (interleaved)
             flash::copy_rotary_interleaved<Is_even_K>(
-                tQgQ, tQsQ, tRgCos, tRgSin, tQcQ, binfo.actual_seqlen_q - m_block * kBlockM,
-                0, params.d, params.rotary_dim
+                tQgQ, 
+                tQsQ, 
+                tRgCos, 
+                tRgSin, 
+                tQcQ, 
+                binfo.actual_seqlen_q - m_block * kBlockM,
+                0, 
+                params.d, 
+                params.rotary_dim
             );
         } else {
             flash::copy_rotary_contiguous<Is_even_K>(
-                tQgQ, tQsQ, tRgCosCont, tRgSinCont, tQcQ, binfo.actual_seqlen_q - m_block * kBlockM,
-                0, params.d, params.rotary_dim
+                tQgQ, 
+                tQsQ, 
+                tRgCosCont, 
+                tRgSinCont, 
+                tQcQ, 
+                binfo.actual_seqlen_q - m_block * kBlockM,
+                0, 
+                params.d, 
+                params.rotary_dim
             );
         }
     }
 
     int n_block = n_block_max - 1;
-    // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
-                                       binfo.actual_seqlen_k - n_block * kBlockN);
+    // We don't need to clear the sK smem tiles since we'll mask out the scores
+    // anyway.
+    flash::copy<Is_even_MN, Is_even_K>(
+      gmem_tiled_copy_QKV, 
+      tKgK, 
+      tKsK, 
+      tKVcKV, 
+      tKVpKV,
+      binfo.actual_seqlen_k - n_block * kBlockN);
     cute::cp_async_fence();
 
     // flash::cp_async_wait<0>();
@@ -832,13 +1298,30 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     flash::Softmax<2 * size<1>(acc_o)> softmax;
 
-    const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
-    flash::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
+    const float alibi_slope = 
+        !Has_alibi 
+      ? 0.0f 
+      : reinterpret_cast<float *>(
+          params.alibi_slopes_ptr
+        )[
+            bidb * params.alibi_slopes_batch_stride 
+          + bidh] / params.scale_softmax;
+    flash::Mask<Is_causal, Is_local, Has_alibi> mask(
+      binfo.actual_seqlen_k, 
+      binfo.actual_seqlen_q, 
+      params.window_size_left, 
+      params.window_size_right, 
+      alibi_slope);
 
-    // For performance reason, we separate out two kinds of iterations:
-    // those that need masking on S, and those that don't.
-    // We need masking on S for the very last block when K and V has length not multiple of kBlockN.
-    // We also need masking on S if it's causal, for the last ceil_div(kBlockM, kBlockN) blocks.
+    // For performance reasons, we separate out two kinds of iterations: those
+    // that need masking on S, and those that don't.
+    //
+    // We need masking on S for the very last block when K and V has length not
+    // multiple of kBlockN.
+    //
+    // We also need masking on S if it's causal, for the last ceil_div(kBlockM,
+    // kBlockN) blocks.
+    //
     // We will have at least 1 "masking" iteration.
 
     // If not even_N, then seqlen_k might end in the middle of a block. In that case we need to
@@ -872,11 +1355,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             );
         }
         cute::cp_async_fence();
-
+//                                                                                                     flash::gemm
         flash::gemm(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
+//                                                                                                   apply_softcap
         // if (cute::thread0()) { print(acc_s); }
         if constexpr (Is_softcap){
             flash::apply_softcap(acc_s, params.softcap);
@@ -901,11 +1385,20 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
                 const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
                 const int block_table_offset_next =(n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
-                tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+                tKgK.data() = 
+                    tKgK.data() 
+                  + (
+                        block_table[block_table_idx_next] 
+                      - block_table[block_table_idx_cur]) * params.k_batch_stride 
+                      + (block_table_offset_next 
+                      - block_table_offset_cur
+                    ) 
+                  * params.k_row_stride;
             }
+//                                                                                                     flash::copy
             flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
+            // This cp_async_fence needs to be in the if block, otherwise the
+            // synchronization isn't right and we get race conditions.
             cute::cp_async_fence();
         }
 
@@ -920,7 +1413,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-
+//                                                                                                  flash::gemm_rs
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -929,7 +1422,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             break;
         }
     }
-
+//                                                                                       for (blocks) no masking S
     // These are the iterations where we don't need masking on S
     for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -987,8 +1480,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
 
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+//                                                                                      /for (blocks) no masking S
     }
-
+//                                                                                                             epi
     // Epilogue
 
     Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax);
@@ -1010,7 +1504,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // sOaccum is larger than sQ, so we need to syncthreads here
     // TODO: allocate enough smem for sOaccum
     if constexpr (Split) { __syncthreads(); }
-
+//                                                                                                      cute::copy
     cute::copy(smem_tiled_copy_Oaccum, taccOrOaccum, taccOsOaccum);
 
     const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
@@ -1061,9 +1555,21 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         #pragma unroll
         for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
     }
+//                                                                                                  copy Oaccum rg
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+    flash::copy<
+      Is_even_MN, 
+      Is_even_K, 
+      /*Clear_OOB_MN=*/false, 
+      /*Clear_OOB_K=*/false
+    >(
+        gmem_tiled_copy_Oaccum,// ->             tiled_copy
+        tOrOaccum,//              ->             S
+        tOgOaccum,//              ->             D
+        tOcO,//                   ->             identity_MN
+        tOpO,//                   ->             predicate_K
+          binfo.actual_seqlen_q 
+        - m_block * kBlockM//     ->             max_MN
     );
 }
 

@@ -291,11 +291,19 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
     return 1;
 }
 
-std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, const int batch_size,
-    const int num_heads, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
-    const int head_size_rounded, const float p_dropout,
-    const int num_splits, cudaDeviceProp *dprops, struct c10::TensorOptions opts) {
-
+std::tuple<at::Tensor, at::Tensor> 
+set_params_splitkv(
+    Flash_fwd_params     & params, 
+    int             const  batch_size,
+    int             const  head_size,
+    int             const  max_seqlen_k,
+    int             const  max_seqlen_q,
+    int             const  head_size_rounded,
+    float           const  p_dropout,
+    int             const  num_splits,
+    cudaDeviceProp       * dprops, 
+    struct c10::TensorOptions opts)
+{
     // This needs to match with run_mha_fwd_splitkv_dispatch
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
@@ -343,11 +351,11 @@ void set_params_alibi(Flash_fwd_params &params, c10::optional<at::Tensor> &alibi
 }
 
 std::vector<at::Tensor>
-mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
-        const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
-        const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
-        c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
-        c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+mha_fwd(at::Tensor &q,//                             ~ (batch_size, seqlen_q, num_heads,   round_multiple(head_size, 8))
+        const at::Tensor &k,//                       ~ (batch_size, seqlen_k, num_heads_k, round_multiple(head_size, 8))
+        const at::Tensor &v,//                       ~ (batch_size, seqlen_k, num_heads_k, round_multiple(head_size, 8))
+        c10::optional<at::Tensor> &out_,//           ~ (batch_size, seqlen_q, num_heads,   round_multiple(head_size, 8))
+        c10::optional<at::Tensor> &alibi_slopes_,//  ~ (num_heads,)       or         (batch_size, num_heads)
         const float p_dropout,
         const float softmax_scale,
         bool is_causal,
@@ -355,8 +363,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         int window_size_right,
         const float softcap,
         const bool return_softmax,
-        c10::optional<at::Generator> gen_) {
-
+        c10::optional<at::Generator> gen_) 
+{
     auto dprops = at::cuda::getCurrentDeviceProperties();
     // bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
@@ -411,8 +419,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         seqlen_q = ngroups;
         num_heads = num_heads_k;
     }
-
-    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
+//                                                                                         Check shapes of {q,k,v}
+    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads,   head_size);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
 
@@ -453,6 +461,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     }
 
     Flash_fwd_params params;
+//                                                                                                set_params_fprop
     set_params_fprop(params,
                      batch_size,
                      seqlen_q, seqlen_k,
@@ -513,30 +522,40 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     }
     return {out, softmax_lse, p, rng_state};
 }
-
+// 
+// total_q       := \sum_{i=0}^{b} s_i)
+//        
+// total_k  (k)  :=      \sum_{i=0}^{b} s_i 
+//               or      num_blocks * page_block_size * num_heads_k * head_size            (if there's a block_table)
+// 
+// total_k (out) := \sum_{i=0}^{b} s_i
+// 
 std::vector<at::Tensor>
-mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
-               const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-               const at::Tensor &v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-               c10::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-               const at::Tensor &cu_seqlens_q,  // b+1
-               const at::Tensor &cu_seqlens_k,  // b+1
-               c10::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
-               c10::optional<const at::Tensor> &leftpad_k_, // batch_size
-               c10::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
-               c10::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
-               int max_seqlen_q,
-               const int max_seqlen_k,
-               const float p_dropout,
-               const float softmax_scale,
-               const bool zero_tensors,
-               bool is_causal,
-               int window_size_left,
-               int window_size_right,
-               const float softcap,
-               const bool return_softmax,
-               c10::optional<at::Generator> gen_) {
-
+mha_varlen_fwd(
+  at::Tensor &q,//                                    ~ (total_q, num_heads, head_size)          
+  const at::Tensor &k,//                              ~ (total_k, num_heads_k, head_size)
+  const at::Tensor &v,//                              ~ (total_k, num_heads_k, head_size)
+  c10::optional<at::Tensor> &out_,//                  ~ (total_q, num_heads, head_size, 
+  const at::Tensor &cu_seqlens_q,//                   ~  b+1
+  const at::Tensor &cu_seqlens_k,//                   ~  b+1
+  c10::optional<at::Tensor> &seqused_k,//             ~  b 
+  // ^^^ If given, only this many elements 
+  // of each batch element's keys are used.
+  c10::optional<const at::Tensor> &leftpad_k_,//      ~ batch_size
+  c10::optional<at::Tensor> &block_table_,//          ~ (batch_size, max_num_blocks_per_seq)
+  c10::optional<at::Tensor> &alibi_slopes_,//         ~ (num_heads,) or   (b, num_heads)
+  int max_seqlen_q,
+  const int max_seqlen_k,
+  const float p_dropout,
+  const float softmax_scale,
+  const bool zero_tensors,
+  bool is_causal,
+  int window_size_left,
+  int window_size_right,
+  const float softcap,
+  const bool return_softmax,
+  c10::optional<at::Generator> gen_) 
+{
     auto dprops = at::cuda::getCurrentDeviceProperties();
     // bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
@@ -606,7 +625,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     const int total_q = q.sizes()[0];
-
+//                                                                               Checks on head_size and num_heads
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
@@ -614,8 +633,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     if (window_size_left >= max_seqlen_k) { window_size_left = -1; }
     if (window_size_right >= max_seqlen_k) { window_size_right = -1; }
-
+//                                                                                                   check shape q
     CHECK_SHAPE(q, total_q, num_heads, head_size);
+//                                                                                  check shape {k,v} (ie kvcache)
     if (!paged_KV) {
         const int total_k = k.size(0);
         CHECK_SHAPE(k, total_k, num_heads_k, head_size);
@@ -625,7 +645,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size);
         CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     }
-
+//                                                                                        check shape cu_seqlens_q
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
     if (seqused_k.has_value()){
@@ -633,6 +653,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         TORCH_CHECK(seqused_k_.dtype() == torch::kInt32, "seqused_k must have dtype int32");
         TORCH_CHECK(seqused_k_.is_cuda(), "seqused_k must be on CUDA device");
         TORCH_CHECK(seqused_k_.is_contiguous(), "seqused_k must be contiguous");
+//                                                                                           check shape seqused_k
         CHECK_SHAPE(seqused_k_, batch_size);
     }
 
@@ -642,6 +663,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+//                                                                                                 check shape out
         CHECK_SHAPE(out, sizes[0], sizes[1], head_size);
         if (seqlenq_ngroups_swapped) {
             out = out.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size});
@@ -678,6 +700,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     Flash_fwd_params params;
+//                                                                                                set_params_fprop
     set_params_fprop(params,
                      batch_size,
                      max_seqlen_q, max_seqlen_k,
@@ -698,7 +721,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      seqlenq_ngroups_swapped,
                      /*unpadded_lse*/true);
     params.total_q = total_q;
-
+//                                                                                        set FP/block_table stuff
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
         params.block_table_batch_stride = block_table.stride(0);
@@ -710,6 +733,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     at::Tensor softmax_lse_accum, out_accum;
     if (seqlenq_ngroups_swapped) {
         // Only apply split-k for decoding
+//                                                                                              set_params_splitkv
         std::tie(softmax_lse_accum, out_accum) =
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,
@@ -1233,28 +1257,40 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 }
 
 std::vector<at::Tensor>
-mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
-                const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-                const at::Tensor &vcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-                c10::optional<const at::Tensor> &k_, // batch_size x seqlen_knew x num_heads_k x head_size
-                c10::optional<const at::Tensor> &v_, // batch_size x seqlen_knew x num_heads_k x head_size
-                c10::optional<const at::Tensor> &seqlens_k_, // batch_size
-                c10::optional<const at::Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
-                c10::optional<const at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
-                c10::optional<const at::Tensor> &cache_batch_idx_, // indices to index into the KV cache
-                c10::optional<const at::Tensor> &leftpad_k_, // batch_size
-                c10::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
-                c10::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
-                c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
-                const float softmax_scale,
-                bool is_causal,
-                int window_size_left,
-                int window_size_right,
-                const float softcap,
-                bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int num_splits
-                ) {
-
+mha_fwd_kvcache(
+    at::Tensor                &q,//                     ~ (batch_size,   seqlen_q,        num_heads,   head_size)
+    at::Tensor                const& kcache,//          ~ (batch_size_c, seqlen_k,        num_heads_k, head_size)
+    //                                                 or (num_blocks,   page_block_size, num_heads_k, head_size)    (if there's a block_table)
+    at::Tensor                const& vcache,//          ~ (batch_size_c, seqlen_k,        num_heads_k, head_size)
+    //                                                 or (num_blocks,   page_block_size, num_heads_k, head_size)    (if there's a block_table)
+    c10::optional<const at::Tensor>& k_,//              ~ (batch_size,   seqlen_knew,     num_heads_k, head_size)
+    c10::optional<const at::Tensor>& v_, //             ~ (batch_size,   seqlen_knew,     num_heads_k, head_size)
+    c10::optional<const at::Tensor>& seqlens_k_, //     ~ batch_size
+    c10::optional<const at::Tensor>& rotary_cos_, //    ~ (seqlen_ro,    (rotary_dim / 2))
+    c10::optional<const at::Tensor>& rotary_sin_, //    ~ (seqlen_ro,    (rotary_dim / 2))
+    c10::optional<const at::Tensor>& cache_batch_idx_, 
+    // ^^^ indices to index into the KV cache 
+    // in the non-paged case
+    c10::optional<const at::Tensor>& leftpad_k_,//      ~ batch_size
+    c10::optional<at::Tensor>      & block_table_,//    ~ (batch_size,   max_num_blocks_per_seq)
+    c10::optional<at::Tensor>      & alibi_slopes_,//   ~ num_heads 
+    //                                                 or (batch_size,   num_heads)
+    c10::optional<at::Tensor>      & out_,//            ~ (batch_size,   seqlen_q,        num_heads,   head_size)
+    float                     const  softmax_scale,
+    // (3.0) optional<Tensor>& descale_q_
+    // (3.0) optional<Tensor>& descale_k_
+    // (3.0) optional<Tensor>& descale_v_
+    bool                             is_causal,
+    int                              window_size_left,
+    int                              window_size_right,
+    const float                      softcap,
+    bool                             is_rotary_interleaved,
+    // ^^ if true, rotary combines indices 0 & 1, 
+    // else indices 0 & rotary_dim / 2
+    int                              num_splits)
+    // (3.0) int  max_seqlen_k_hint
+    // (3.0) bool use_gqa_packing
+{
     auto dprops = at::cuda::getCurrentDeviceProperties();
     // bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
@@ -1287,7 +1323,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
         TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
     }
-
+    // 
+    // What is this method `sizes`?
+    // 
     const auto sizes = q.sizes();
 
     const int batch_size = sizes[0];
@@ -1298,6 +1336,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : kcache.size(0);
     const int page_block_size = !paged_KV ? 1 : kcache.size(1);
+//                                                                                           Check 256 | page_size
     TORCH_CHECK(!paged_KV || page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
     const int seqlen_k = !paged_KV ? kcache.size(1) : max_num_blocks_per_seq * page_block_size;
     const int num_heads_k = kcache.size(2);
@@ -1323,6 +1362,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (window_size_left >= seqlen_k) { window_size_left = -1; }
     if (window_size_right >= seqlen_k) { window_size_right = -1; }
 
+//                                                                                       Check shape of {k,v}cache
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
     if (!paged_KV) {
         CHECK_SHAPE(kcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
@@ -1371,6 +1411,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
     Flash_fwd_params params;
+//                                                                                                set_params_fprop
     set_params_fprop(params,
                      batch_size,
                      seqlen_q, seqlen_k,
@@ -1412,6 +1453,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
             k_padded = k;
             v_padded = v;
         }
+//                                                                                           set FP/{k,v}new stuff
         params.seqlen_knew = seqlen_knew;
         params.knew_ptr = k_padded.data_ptr();
         params.vnew_ptr = v_padded.data_ptr();
@@ -1423,7 +1465,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         params.knew_head_stride = k_padded.stride(-2);
         params.vnew_head_stride = v_padded.stride(-2);
     }
-
+//                                                                                           check shape seqlens_k
     if (seqlens_k_.has_value()) {
         auto seqlens_k = seqlens_k_.value();
         TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqlens_k must have dtype int32");
@@ -1479,10 +1521,11 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
+//                                                                                              set_params_splitkv
     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
         params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
         head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, opts);
-
+//                                                                                        set FP/block_table stuff
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
         params.block_table_batch_stride = block_table.stride(0);
@@ -1496,7 +1539,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,
     // or paged KV cache
     run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
-
+// if head_size_og not divisible by 8
     if (head_size_og % 8 != 0) {
         out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
         if (out_.has_value()) { out_.value().copy_(out); }
@@ -1514,7 +1557,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
     return {out, softmax_lse};
 }
-
+// 
+// (Same fcn names as in 3.0)
+// 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");

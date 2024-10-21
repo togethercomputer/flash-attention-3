@@ -131,6 +131,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     dim3 block_dims = AttnKernel::get_block_shape();
     dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
     cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
+    //
+    // Interesting, so FA3/bwd uses the Cutlass launching stuff while FA3/fwd
+    // uses an actual __global__ (ie compute_attn_ws)
+    //
     cutlass::launch_kernel_on_cluster(launch_params, kernel, kernel_params);
     CHECK_CUDA_KERNEL_LAUNCH();
 
