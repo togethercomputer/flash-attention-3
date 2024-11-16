@@ -1904,6 +1904,9 @@ def test_flash_attn_splitkv(
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
+#
+# EA: This appears never to test the "appending to kvcache" feature
+#
 def test_flash_attn_kvcache(
     seqlen_q,
     seqlen_k,
@@ -1935,6 +1938,9 @@ def test_flash_attn_kvcache(
     torch.random.manual_seed(0)
     batch_size = 2
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
+    # 
+    # ^^^ Why * 2?
+    # 
     nheads = 6
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
@@ -1965,6 +1971,9 @@ def test_flash_attn_kvcache(
         )
     cache_seqlens = torch.randint(
         0 if new_kv else 1,
+        #
+        # EA: Don't understand this vvv comment
+        #
         # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
         (
             (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)

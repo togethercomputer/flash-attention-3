@@ -74,7 +74,7 @@ __forceinline__ __device__ uint32_t convert_relu2<cutlass::half_t>(const float2 
 }
 
 template<>
-__forceinline__ __device__ uint32_t convert_relu2<cutlass::bfloat16_t>(const float2 x) {
+__forceinline__ __device__ uint32_t convert_relu2<cutlass::bfloat16     _t>(const float2 x) {
     uint32_t res;
     const uint32_t a = reinterpret_cast<const uint32_t&>(x.x);
     const uint32_t b = reinterpret_cast<const uint32_t&>(x.y);
@@ -291,12 +291,30 @@ void cp_async_wait() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
-          typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
-          typename Engine2, typename Layout2, typename Engine3, typename Layout3>
-__forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const &S,
-                            Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
-                            Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
+template <
+  bool Is_even_MN=true, 
+  bool Is_even_K=true, 
+  bool Clear_OOB_MN=false, 
+  bool Clear_OOB_K=true,
+  typename TiledCopy, 
+  typename Engine0, 
+  typename Layout0, 
+  typename Engine1, 
+  typename Layout1,
+  typename Engine2, 
+  typename Layout2, 
+  typename Engine3, 
+  typename Layout3
+>
+__forceinline__ __device__ void 
+copy(
+  TiledCopy                       tiled_copy,
+  Tensor<Engine0, Layout0> const& S,
+  Tensor<Engine1, Layout1>      & D, 
+  Tensor<Engine2, Layout2> const& identity_MN,
+  Tensor<Engine3, Layout3> const& predicate_K, 
+  int                      const  max_MN=0)
+{
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
     CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
@@ -360,28 +378,43 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <bool Is_even_K=true,
-          typename Engine0, typename Layout0, typename Engine1, typename Layout1,
-          typename Engine2, typename Layout2, typename Engine3, typename Layout3>
-__forceinline__ __device__ void copy_w_min_idx(Tensor<Engine0, Layout0> const &S,
-                                      Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
-                                      Tensor<Engine3, Layout3> const &predicate_K,
-                                      const int max_MN=0, const int min_MN=0) {
+template <
+  bool Is_even_K=true,
+  typename Engine0, 
+  typename Layout0, 
+  typename Engine1, 
+  typename Layout1,
+  typename Engine2, 
+  typename Layout2, 
+  typename Engine3, 
+  typename Layout3
+>
+__forceinline__ __device__ void
+copy_w_min_idx(
+  Tensor<Engine0, Layout0> const& S,
+  Tensor<Engine1, Layout1>      & D, 
+  Tensor<Engine2, Layout2> const& identity_MN,
+  Tensor<Engine3, Layout3> const& predicate_K,
+  int                      const  max_MN=0,
+  int                      const  min_MN=0) 
+{
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
     CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
-    CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
-    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));                     // MMA_M
-    CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));                     // MMA_K
+    CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));  // MMA
+    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));  // MMA_M
+    CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));  // MMA_K
     // if (threadIdx.x == 0 && blockIdx.z == 0) { printf("blockIdx.y = %d, max_MN = %d, min_MN = %d\n", blockIdx.y, max_MN, min_MN); }
     #pragma unroll
     for (int m = 0; m < size<1>(S); ++m) {
         // if (threadIdx.x == 0 && blockIdx.z == 0) { printf("blockIdx.y = %d, m = %d\n", blockIdx.y, get<0>(identity_MN(0, m, 0))); }
-        if (get<0>(identity_MN(0, m, 0)) >= min_MN && get<0>(identity_MN(0, m, 0)) < max_MN) {
+        if (   get<0>(identity_MN(0, m, 0)) >= min_MN 
+            && get<0>(identity_MN(0, m, 0)) <  max_MN) {
             // if (threadIdx.x == 0 && blockIdx.z == 0) { printf("Inner loop, blockIdx.y = %d, m = %d\n", blockIdx.y, get<0>(identity_MN(0, m, 0))); }
             #pragma unroll
             for (int k = 0; k < size<2>(S); ++k) {
-                if (Is_even_K || predicate_K(k)) {
-                    cute::copy(S(_, m, k), D(_, m, k));
+                if (   Is_even_K 
+                    || predicate_K(k)) {
+                  cute::copy(S(_, m, k), D(_, m, k));
                 }
             }
         }

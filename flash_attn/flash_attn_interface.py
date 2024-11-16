@@ -1422,8 +1422,9 @@ def flash_attn_varlen_func(
         return_attn_probs,
         block_table,
     )
-
-
+#
+# Note this does not afaik modify the cache_seqlens in place. You could argue that it should.
+#
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -1546,11 +1547,11 @@ def flash_attn_with_kvcache(
     block_table = maybe_contiguous(block_table)
     out, softmax_lse = flash_attn_cuda.fwd_kvcache(
         q,
-        k_cache,
-        v_cache,
+        k_cache,       # -> c10::optional<const at::Tensor> &k_ (const?!)
+        v_cache,       # -> c10::optional<const at::Tensor> &v_
         k,
         v,
-        cache_seqlens,
+        cache_seqlens, # -> c10::optional<const at::Tensor> &seqlens_k_
         rotary_cos,
         rotary_sin,
         cache_batch_idx,

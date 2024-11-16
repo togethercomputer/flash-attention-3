@@ -20,7 +20,29 @@ constexpr int H_DIM = 1;
 constexpr int D_DIM = 2;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
+// 
+// K             ~ (B, s, H, Z) : (s_B,K  s_R,K  s_H,K  1)
+// 
+// V             ~ (B, s, H, Z) : (s_B,V  s_R,V  s_H,V  1)
+// 
+// R_sin, R_cos  ~ (Z_R)        : (1)
+/*
+// ^^ often Z_R would be Z / 2, in the actual code they have it as rotary_dim =
+2 * Z_R, for Z_R as I wrote it
+*/ 
+// block_table_offset = kBlockN                        ->   n_block_max
+//                      block_table_index                   FP/page_block_max
+// 
+// (I guess ^^^ in units of sequence elements)
+// 
+// offset_k           = block_table[block_table_index]  ->  s_B,K
+//                      block_table_offset                  s_R,K
+//                      bidh / h_h_k_ratio                  s_H,K
+// 
+// offset_v           = (same coords)                   ->  s_B,V
+//                                                          s_R,V
+//                                                          s_H,V
+// 
 struct Qkv_params {
     using index_t = int64_t;
     // The QKV matrices.
@@ -105,6 +127,9 @@ struct Flash_fwd_params : public Qkv_params {
     // Paged KV cache
     int * __restrict__ block_table;
     index_t block_table_batch_stride;
+    // 
+    // EA: Why is there only one stride here?
+    // 
     int page_block_size;
 
     // The dropout probability (probability of keeping an activation).

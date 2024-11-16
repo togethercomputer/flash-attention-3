@@ -20,7 +20,9 @@
 
 
 using namespace cute;
-
+// 
+// EA: PagedKV, PackGQA, Split are new
+// 
 template <int kHeadDim, int kBlockM, int kBlockN, int kStages, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKV, bool AppendKV, bool PackGQA, bool Split, bool V_colmajor>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
@@ -140,7 +142,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     }
     CHECK_CUDA_KERNEL_LAUNCH();
 }
-
+// 
+// EA: The kStages is new here
+// 
 template<typename T, int kBlockM, int kBlockN, int kHeadDim, int kStages,
          bool Is_causal, bool Is_local, bool V_colmajor, bool Enable_cluster>
 void run_mha_fwd_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
