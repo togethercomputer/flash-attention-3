@@ -19,35 +19,35 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-namespace pybind11::detail {
+// namespace pybind11::detail {
 
-    template <>
-    struct type_caster<at::ScalarType> {
-    public:
-        // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
-        PYBIND11_TYPE_CASTER(at::ScalarType, _("torch.dtype"));
-        // PYBIND11_TYPE_CASTER defines a member field called value. at::ScalarType
-        // cannot be default-initialized, we provide this constructor to explicitly
-        // initialize that field. The value doesn't matter as it will be overwritten
-        // after a successful call to load.
-        type_caster() : value(at::kFloat) {}
-        bool load(handle src, bool) {
-            PyObject* obj = src.ptr();
-            if (THPDtype_Check(obj)) {
-                value = reinterpret_cast<THPDtype*>(obj)->scalar_type;
-                return true;
-            }
-            return false;
-        }
-        static handle cast(
-                           const at::ScalarType& src,
-                           return_value_policy /* policy */,
-                           handle /* parent */) {
-            return Py_NewRef(torch::getTHPDtype(src));
-        }
-    };
+//     template <>
+//     struct type_caster<at::ScalarType> {
+//     public:
+//         // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+//         PYBIND11_TYPE_CASTER(at::ScalarType, _("torch.dtype"));
+//         // PYBIND11_TYPE_CASTER defines a member field called value. at::ScalarType
+//         // cannot be default-initialized, we provide this constructor to explicitly
+//         // initialize that field. The value doesn't matter as it will be overwritten
+//         // after a successful call to load.
+//         type_caster() : value(at::kFloat) {}
+//         bool load(handle src, bool) {
+//             PyObject* obj = src.ptr();
+//             if (THPDtype_Check(obj)) {
+//                 value = reinterpret_cast<THPDtype*>(obj)->scalar_type;
+//                 return true;
+//             }
+//             return false;
+//         }
+//         static handle cast(
+//                            const at::ScalarType& src,
+//                            return_value_policy /* policy */,
+//                            handle /* parent */) {
+//             return Py_NewRef(torch::getTHPDtype(src));
+//         }
+//     };
 
-} // namespace pybind11::detail
+// } // namespace pybind11::detail
 
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
