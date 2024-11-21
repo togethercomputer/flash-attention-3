@@ -293,6 +293,109 @@ def attention_ref(
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
+def attention_ref_new(
+    q,
+    k,
+    v,
+    query_padding_mask=None,
+    key_padding_mask=None,
+    key_leftpad=None,
+    attn_bias=None,
+    dropout_p=0.0,
+    dropout_mask=None,
+    causal=False,
+    q_descale=None, k_descale=None, v_descale=None,
+    window_size=(-1, -1),  # -1 means infinite window size
+    sink_token_length=0,
+    softcap=0.0,
+    upcast=True,
+    reorder_ops=False,
+    intermediate_dtype=None,
+):
+    """
+    Arguments:
+        q: (batch_size, seqlen_q, nheads, head_dim)
+        k: (batch_size, seqlen_k, nheads, head_dim)
+        v: (batch_size, seqlen_k, nheads, head_dim)
+        query_padding_mask: (batch_size, seqlen_q)
+        key_padding_mask: (batch_size, seqlen_k)
+        attn_bias: broadcastable to (batch_size, nheads, seqlen_q, seqlen_k)
+        dropout_p: float
+        dropout_mask: (batch_size, nheads, seqlen_q, seqlen_k)
+        causal: whether to apply causal masking
+        q_descale: (batch_size,) tensor of descaling factors for q
+        k_descale: (batch_size,) tensor of descaling factors for k
+        v_descale: (batch_size,) tensor of descaling factors for v
+        upcast: whether to cast all inputs to fp32, do all computation in fp32, then cast
+            output back to fp16/bf16.
+        reorder_ops: whether to change the order of operations (scaling k instead of scaling k, etc.)
+            without changing the math. This is to estimate the numerical error from operation
+            reordering.
+    Output:
+        output: (batch_size, seqlen_q, nheads, head_dim)
+        attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
+    """
+    if causal:
+        window_size = (window_size[0], 0)
+    dtype_og = q.dtype
+    if upcast:
+        q, k, v = q.float(), k.float(), v.float()
+    if q_descale is not None:
+        # Modified: Reshape descale factor to apply per batch element
+        q = (q.float() * q_descale[:, None, None, None]).to(dtype=q.dtype)
+    if k_descale is not None:
+        # Modified: Reshape descale factor to apply per batch element
+        k = (k.float() * k_descale[:, None, None, None]).to(dtype=k.dtype)
+    if v_descale is not None:
+        # Modified: Reshape descale factor to apply per batch element
+        v = (v.float() * v_descale[:, None, None, None]).to(dtype=v.dtype)
+    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
+    v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
+    d = q.shape[-1]
+    if not reorder_ops:
+        scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
+    else:
+        scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
+    if softcap > 0:
+        scores = torch.tanh(scores / softcap) * softcap
+    if key_padding_mask is not None:
+        scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
+    if window_size[0] >= 0 or window_size[1] >= 0:
+        local_mask = construct_local_mask(
+            seqlen_q,
+            seqlen_k,
+            window_size,
+            sink_token_length,
+            query_padding_mask,
+            key_padding_mask,
+            key_leftpad=key_leftpad,
+            device=q.device,
+        )
+        scores.masked_fill_(local_mask, float("-inf"))
+    if attn_bias is not None:
+        scores = scores + attn_bias
+    attention = torch.softmax(scores, dim=-1).to(v.dtype)
+    # We want to mask here so that the attention matrix doesn't have any NaNs
+    # Otherwise we'll get NaN in dV
+    if query_padding_mask is not None:
+        attention = attention.masked_fill(rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0)
+    # Some rows might be completely masked out so we fill them with zero instead of NaN
+    if window_size[0] >= 0 or window_size[1] >= 0:
+        attention = attention.masked_fill(torch.all(local_mask, dim=-1, keepdim=True), 0.0)
+    dropout_scaling = 1.0 / (1 - dropout_p)
+    # attention_drop = attention.masked_fill(~dropout_mask, 0.0) * dropout_scaling
+    # output = torch.einsum('bhts,bshd->bthd', attention_drop , v)
+    if dropout_mask is not None:
+        attention_drop = attention.masked_fill(~dropout_mask, 0.0)
+    else:
+        attention_drop = attention
+    if intermediate_dtype is not None:
+        attention_drop = attention_drop.to(intermediate_dtype).to(attention_drop.dtype)
+    output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
+    if query_padding_mask is not None:
+        output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 # TODO: deadlock with fp8 and local, probably bc of sink tokens
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
