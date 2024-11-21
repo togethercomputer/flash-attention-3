@@ -477,7 +477,7 @@ def test_flash_attn_output(
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     # window_size = (-1, -1) if not local else (16, 0)
     if dtype == torch.float8_e4m3fn:
-        q_descale, k_descale, v_descale = [torch.rand(1, device=device, dtype=torch.float32) * 2 for _ in range(3)]
+        q_descale, k_descale, v_descale = [torch.rand(batch_size, device=device, dtype=torch.float32) * 2 for _ in range(3)]
     else:
         q_descale, k_descale, v_descale = None, None, None
     q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
@@ -494,7 +494,7 @@ def test_flash_attn_output(
         softcap=softcap,
         num_splits=num_splits
     )
-    out_ref, attn_ref = attention_ref(
+    out_ref, attn_ref = attention_ref_new(
         q_ref,
         k_ref,
         v_ref,
@@ -506,7 +506,7 @@ def test_flash_attn_output(
         sink_token_length=sink_token_length,
         softcap=softcap
     )
-    out_pt, attn_pt = attention_ref(
+    out_pt, attn_pt = attention_ref_new(
         q_ref,
         k_ref,
         v_ref,
@@ -521,6 +521,7 @@ def test_flash_attn_output(
         reorder_ops=True,
         intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
     )
+    # Is it the inclusion of the `intermediate_type` arg that makes it `_pt`?
 
     # qk = torch.einsum('bshd,bthd->bhst', q_ref, k_ref).float()
     # m = qk.amax(-1, keepdim=True)
