@@ -1622,7 +1622,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         if (q_descale_.has_value()) {
             auto q_descale = q_descale_.value();
             CHECK_DEVICE(q_descale);
-            CHECK_SHAPE(q_descale, 1);
+            CHECK_SHAPE(q_descale, batch_size);
             params.q_descale_ptr = q_descale.data_ptr<float>();
         } else {
             params.q_descale_ptr = nullptr;
@@ -1630,7 +1630,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         if (k_descale_.has_value()) {
             auto k_descale = k_descale_.value();
             CHECK_DEVICE(k_descale);
-            CHECK_SHAPE(k_descale, 1);
+            CHECK_SHAPE(k_descale, batch_size);
             params.k_descale_ptr = k_descale.data_ptr<float>();
         } else {
             params.k_descale_ptr = nullptr;
@@ -1638,7 +1638,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         if (v_descale_.has_value()) {
             auto v_descale = v_descale_.value();
             CHECK_DEVICE(v_descale);
-            CHECK_SHAPE(v_descale, 1);
+            CHECK_SHAPE(v_descale, batch_size);
             params.v_descale_ptr = v_descale.data_ptr<float>();
         } else {
             params.v_descale_ptr = nullptr;
