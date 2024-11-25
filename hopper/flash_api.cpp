@@ -1426,13 +1426,13 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     }
 
     int const alignment = q_type == torch::kFloat8_e4m3fn ? 16 : 8;
-    at::Tensor q_padded, k_padded, v_padded;
+    at::Tensor q_padded, kcache_padded, vcache_padded;
     auto pad = [](at::Tensor x, int alignment) {
         return x.size(-1) % alignment == 0 ? x : torch::nn::functional::pad(x, torch::nn::functional::PadFuncOptions({0, alignment - x.size(-1) % alignment}));
     };
     q_padded = pad(q, alignment);
-    k_padded = pad(kcache, alignment);
-    v_padded = pad(vcache, alignment);
+    kcache_padded = pad(kcache, alignment);
+    vcache_padded = pad(vcache, alignment);
 
     auto opts = q.options();
     auto out_type = q_type == at::ScalarType::Float8_e4m3fn ? at::ScalarType::BFloat16 : q_type;
@@ -1471,7 +1471,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
                      seqlen_q_rounded, seqlen_k_rounded,
                      num_heads, num_heads_k,
                      head_size, head_size_rounded,
-                     q_padded, k_padded, v_padded, out,
+                     q_padded, kcache_padded, vcache_padded, out,
                      /*cu_seqlens_q_d=*/!is_varlen_q ? nullptr : cu_seqlens_q.data_ptr(),
                      /*cu_seqlens_k_d=*/nullptr,
                      /*seqused_q_=*/nullptr,
@@ -1529,7 +1529,7 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
     params.num_pages = num_pages;
 
     if (k_.has_value()) {
-        at::Tensor k, v, k_padded, v_padded;
+        at::Tensor k, v, knew_padded, vnew_padded;
         TORCH_CHECK(v_.has_value(), "If key is supplied, value must also be passed in");
         TORCH_CHECK(seqused_k_.has_value(), "If key is supplied, seqlens_k must also be passed in");
         TORCH_CHECK(seqlen_q <= seqlen_k, "If key is supplied, it must have seqlen <= the seqlen of the KV cache");
@@ -1543,23 +1543,18 @@ mha_fwd_kvcache(at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_siz
         int seqlen_knew = k.size(1);
         CHECK_SHAPE(k, batch_size, seqlen_knew, num_heads_k, head_size_og);
         CHECK_SHAPE(v, batch_size, seqlen_knew, num_heads_k, head_size_og);
-        if (head_size_og % 8 != 0) {
-            k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-            v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
-        } else {
-            k_padded = k;
-            v_padded = v;
-        }
+        knew_padded = pad(k, alignment);
+        vnew_padded = pad(v, alignment);
         params.seqlen_knew = seqlen_knew;
-        params.knew_ptr = k_padded.data_ptr();
-        params.vnew_ptr = v_padded.data_ptr();
+        params.knew_ptr = knew_padded.data_ptr();
+        params.vnew_ptr = vnew_padded.data_ptr();
         // All stride are in elements, not bytes.
-        params.knew_batch_stride = k_padded.stride(0);
-        params.vnew_batch_stride = v_padded.stride(0);
-        params.knew_row_stride = k_padded.stride(-3);
-        params.vnew_row_stride = v_padded.stride(-3);
-        params.knew_head_stride = k_padded.stride(-2);
-        params.vnew_head_stride = v_padded.stride(-2);
+        params.knew_batch_stride = knew_padded.stride(0);
+        params.vnew_batch_stride = vnew_padded.stride(0);
+        params.knew_row_stride   = knew_padded.stride(-3);
+        params.vnew_row_stride   = vnew_padded.stride(-3);
+        params.knew_head_stride  = knew_padded.stride(-2);
+        params.vnew_head_stride  = vnew_padded.stride(-2);
     }
 
     if (leftpad_k_.has_value()) {
