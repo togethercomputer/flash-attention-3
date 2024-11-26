@@ -53,7 +53,7 @@ num_splits            = 1
 pack_gqa_             = False
 
 (
-    mha_fwd_output_with_no_descale,
+    mha_fwd_output_no_descale     ,
     q_padded                      ,
     k_padded                      ,
     v_padded                      ,
@@ -66,9 +66,9 @@ pack_gqa_             = False
     out_                          ,
     softmax_scale                 ,
     is_causal                     ,
-    q_descale_trivial             ,
-    k_descale_trivial             ,
-    v_descale_trivial             ,
+    None                          ,
+    None                          ,
+    None                          ,
     window_size_left              ,
     window_size_right             ,
     sink_token_length             ,
@@ -119,19 +119,7 @@ ref_no_descale  , attn_ref       = attention_ref   (
     None,
     None,
     causal=is_causal,
-    q_descale=q_descale_trivial_0, k_descale=k_descale_trivial_0, v_descale=v_descale_trivial_0,
-    window_size=window_size,
-    sink_token_length=sink_token_length,
-    softcap=softcap
-)
-ref_one_descale , attn_ref      = attention_ref    (
-    q_ref,
-    k_ref,
-    v_ref,
-    None,
-    None,
-    causal=is_causal,
-    q_descale=q_descale_0        , k_descale=k_descale_0        , v_descale=v_descale_0        ,
+    q_descale=None      , k_descale=None      , v_descale=None,
     window_size=window_size,
     sink_token_length=sink_token_length,
     softcap=softcap
@@ -143,7 +131,7 @@ ref_with_descale, attn_ref_new = attention_ref_new (
     None,
     None,
     causal=is_causal,
-    q_descale=q_descale_         , k_descale=k_descale_        , v_descale=v_descale_           ,
+    q_descale=q_descale_, k_descale=k_descale_ , v_descale=v_descale_,
     window_size=window_size,
     sink_token_length=sink_token_length,
     softcap=softcap
@@ -154,8 +142,8 @@ ref_with_descale, attn_ref_new = attention_ref_new (
 print(  "v_descale_")
 print(f"{v_descale_    }")
 print()
-print(  "mha_fwd_output_with_no_descale")
-print(f"{mha_fwd_output_with_no_descale}")
+print(  "mha_fwd_output_no_descale")
+print(f"{mha_fwd_output_no_descale}")
 print()
 print(  "ref_no_descale")
 print(f"{ref_no_descale}")
@@ -166,6 +154,6 @@ print()
 print(  "ref_with_descale")
 print(f"{ref_with_descale}")
 print() 
-
-print(f"{(mha_fwd_output_with_descale - ref_per_element_descale).abs().max().item() = }")
-
+print(f"{(mha_fwd_output_no_descale - ref_no_descale).abs().max().item() = }")
+print()
+print(f"{(mha_fwd_output_with_descale - ref_with_descale).abs().max().item() = }")
