@@ -1129,6 +1129,346 @@ def test_flash_attn_kvcache(
     mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
     assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
 
+# eventually we should always use descale when fp8
+@pytest.mark.parametrize("use_descale", [False, True])
+# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
+# @pytest.mark.parametrize("num_splits", [1] + ([0] if not DISABLE_SPLIT else []))
+@pytest.mark.parametrize("num_splits", [1])
+# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
+@pytest.mark.parametrize("new_kv", [True])
+# @pytest.mark.parametrize("new_kv", [False])
+# @pytest.mark.parametrize("local", [False, True])
+# @pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
+# @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
+@pytest.mark.parametrize("causal,local", [(False, False)])
+# @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True])
+@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
+# @pytest.mark.parametrize("rotary_interleaved", [False, True] if not DISABLE_APPENDKV else [False])
+@pytest.mark.parametrize("rotary_interleaved", [True])
+# @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0] if not DISABLE_APPENDKV else [0.0])
+@pytest.mark.parametrize("rotary_fraction", [0.0])
+# @pytest.mark.parametrize("page_size", [None] + ([1, 4, 128] if not DISABLE_PAGEDKV else []))
+@pytest.mark.parametrize("page_size", [None])
+# @pytest.mark.parametrize("has_leftpad", [False, True])
+@pytest.mark.parametrize("has_leftpad", [False])
+# @pytest.mark.parametrize("has_batch_idx", [False, True])
+@pytest.mark.parametrize("has_batch_idx", [False])
+# @pytest.mark.parametrize("varlen_q", [False, True])
+@pytest.mark.parametrize("varlen_q", [False])
+# @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
+# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
+# @pytest.mark.parametrize('d', [56, 80])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (1, 128),
+        (1, 339),
+        (3, 1024),
+        (64, 800),
+        (64, 256),
+        (3, 799),
+        (64, 2048),
+        (16, 20000),
+        (1, 128 * 1024),
+        (16, 128 * 1024),
+        (128, 128),
+        (256, 512),  # To test appending KV with more than 1 block
+        (2048, 3577),  # Enough tile to test persistent scheduler
+    ],
+)
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
+def test_flash_attn_kvcache_new(
+    seqlen_q,
+    seqlen_k,
+    d,
+    varlen_q,
+    has_batch_idx,
+    has_leftpad,
+    page_size,
+    rotary_fraction,
+    rotary_interleaved,
+    seqlen_new_eq_seqlen_q,
+    causal,
+    local,
+    new_kv,
+    mha_type,
+    num_splits,
+    dtype,
+    use_descale,
+):
+    if page_size is not None and seqlen_k % page_size != 0:
+        pytest.skip()
+    if seqlen_q > seqlen_k and new_kv:
+        pytest.skip()
+    if not new_kv and rotary_fraction > 0.0:
+        pytest.skip()
+    device = "cuda"
+    # set seed
+    torch.random.manual_seed(0)
+    batch_size = 5
+    # batch_size = 1
+    batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
+    nheads = 6
+    # nheads = 1
+    # rotary_dim must be a multiple of 16, and must be <= d
+    rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    assert nheads % nheads_k == 0
+    dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
+    if varlen_q:
+        query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *rest = unpad_input(q, query_padding_mask)
+        output_pad_fn = lambda output_unpad: pad_input(
+            output_unpad, indices_q, batch_size, seqlen_q
+        )
+    else:
+        query_padding_mask = None
+        q_unpad = q
+        cu_seqlens_q, max_seqlen_q = None, None
+    # Put window_size after QKV randn so that window_size changes from test to test
+    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+
+    seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(1, seqlen_q + 1, (1,)).item()
+    if new_kv:
+        k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
+        v = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
+    else:
+        k, v = None, None
+    if page_size is None:
+        k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
+        v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype_ref).to(dtype).to(dtype_ref)
+        page_table = None
+    else:
+        (
+            k_cache,
+            v_cache,
+            page_table,
+            k_cache_paged,
+            v_cache_paged,
+            num_blocks,
+        ) = _generate_block_kvcache(
+            seqlen_k, page_size, batch_size_cache, nheads_k, d, device, dtype_ref
+        )
+    cache_seqlens = torch.randint(
+        0 if new_kv else 1,
+        # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
+        (
+            (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
+            if new_kv
+            else (seqlen_k + 1)
+        ),
+        (batch_size,),
+        dtype=torch.int32,
+        device=device,
+    )
+    if has_leftpad:
+        cache_leftpad = torch.cat([torch.randint(0, cache_seqlens[i].item(), (1,), dtype=torch.int32, device=device)
+                                   if cache_seqlens[i].item() > 0 else torch.zeros(1, dtype=torch.int32, device=device)
+                                   for i in range(batch_size)])
+    else:
+        cache_leftpad = None
+    if has_batch_idx:
+        cache_batch_idx = torch.randperm(batch_size_cache, dtype=torch.int32, device=device)[
+            :batch_size
+        ]
+    else:
+        cache_batch_idx = None
+    arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
+    cache_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
+    key_padding_mask = arange < cache_seqlens_expanded + (seqlen_new if new_kv else 0)
+    if has_leftpad:
+        key_padding_mask = torch.logical_and(
+            key_padding_mask, arange >= cache_leftpad.unsqueeze(-1).expand(-1, seqlen_k)
+        )
+    # cache_seqlens = torch.tensor([64], dtype=torch.int32, device=device)
+    if rotary_dim > 0:
+        angle = (
+            torch.rand(
+                seqlen_k if page_size is None else num_blocks * page_size,
+                rotary_dim // 2,
+                device=device,
+            )
+            * 2
+            * math.pi
+        )
+        cos = torch.cos(angle).to(dtype=dtype_ref).to(dtype).to(dtype_ref)
+        sin = torch.sin(angle).to(dtype=dtype_ref).to(dtype).to(dtype_ref)
+        if causal or local:
+            q_ro = apply_rotary_emb(
+                q, cos, sin, seqlen_offsets=cache_seqlens, interleaved=rotary_interleaved
+            )
+        else:
+            q_ro = rearrange(
+                apply_rotary_emb(
+                    rearrange(q, "b s h d -> b 1 (s h) d"),
+                    cos,
+                    sin,
+                    seqlen_offsets=cache_seqlens,
+                    interleaved=rotary_interleaved,
+                ),
+                "b 1 (s h) d -> b s h d",
+                s=seqlen_q,
+            )
+        # q_ro = q
+        k_ro = apply_rotary_emb(
+            k, cos, sin, seqlen_offsets=cache_seqlens, interleaved=rotary_interleaved
+        )
+    else:
+        cos, sin = None, None
+        q_ro, k_ro = q, k
+    if use_descale:
+        dtype_descale = torch.float32
+        q_descale = torch.rand((batch_size_cache,), dtype = dtype_descale, device = device)
+        k_descale = torch.rand((batch_size_cache,), dtype = dtype_descale, device = device)
+        v_descale = torch.rand((batch_size_cache,), dtype = dtype_descale, device = device)
+    else:
+        q_descale, k_descale, v_descale = None, None, None
+    # k_cache[:, 64:] = -1
+    k_cache_ref = (
+        k_cache if not has_batch_idx else k_cache[cache_batch_idx.to(dtype=torch.long)]
+    ).clone()
+    v_cache_ref = (
+        v_cache if not has_batch_idx else v_cache[cache_batch_idx.to(dtype=torch.long)]
+    ).clone()
+    if new_kv:
+        update_mask = torch.logical_and(
+            cache_seqlens_expanded <= arange, arange < cache_seqlens_expanded + seqlen_new
+        )
+        k_cache_ref[update_mask] = rearrange(k_ro, "b s ... -> (b s) ...")
+        v_cache_ref[update_mask] = rearrange(v, "b s ... -> (b s) ...")
+    k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+    v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+    out_ref, _ = attention_ref_new(
+        q_ro,
+        k_cache_rep,
+        v_cache_rep,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        window_size=window_size,
+        key_leftpad=cache_leftpad,
+    )
+    out_pt, _ = attention_ref_new(
+        q_ro,
+        k_cache_rep,
+        v_cache_rep,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        window_size=window_size,
+        upcast=False,
+        reorder_ops=True,
+        key_leftpad=cache_leftpad,
+        intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None
+    )
+    q = q.to(dtype)
+    q_unpad = q_unpad.to(dtype) if varlen_q else None
+    k_cache = k_cache.to(dtype)
+    v_cache = v_cache.to(dtype)
+    k_cache_paged = k_cache_paged.to(dtype) if page_size is not None else None
+    v_cache_paged = v_cache_paged.to(dtype) if page_size is not None else None
+    k = k.to(dtype) if k is not None else None
+    v = v.to(dtype) if v is not None else None
+    cos = cos.to(dtype) if cos is not None else None
+    sin = sin.to(dtype) if sin is not None else None
+    out, lse, *rest = flash_attn_with_kvcache(
+        q if not varlen_q else q_unpad,
+        k_cache if page_size is None else k_cache_paged,
+        v_cache if page_size is None else v_cache_paged,
+        k,
+        v,
+        rotary_cos=cos,
+        rotary_sin=sin,
+        cache_seqlens=cache_seqlens,
+        cache_batch_idx=cache_batch_idx,
+        cache_leftpad=cache_leftpad,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        window_size=window_size,
+        rotary_interleaved=rotary_interleaved,
+        num_splits=num_splits,
+        return_softmax_lse=True
+    )
+    if varlen_q:
+        out = output_pad_fn(out)
+    # out = flash_attn_with_kvcache(
+    #     q, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=causal, window_size=window_size
+    # )
+    # out = flash_attn_with_kvcache(q, k_cache, v_cache, causal=causal, window_size=window_size)
+    # qk = torch.einsum("bqhd,bkhd->bhqk", q, k_cache_ref)
+    # m = qk.amax(-1, keepdim=True)
+    # s_tmp = torch.exp((qk - m) / math.sqrt(d))
+    # o1 = torch.einsum('bhst,bthd->bshd', s_tmp, v_cache_ref)
+    # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
+    # probs = torch.softmax(qk, dim=-1)
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+    # breakpoint()
+
+    # Check that FlashAttention's numerical error is at most twice the numerical error
+    # of a Pytorch implementation.
+    if new_kv:
+        if page_size is None:
+            k_cache_select = (
+                k_cache if not has_batch_idx else k_cache[cache_batch_idx.to(dtype=torch.long)]
+            ).to(dtype_ref)
+            v_cache_select = (
+                v_cache if not has_batch_idx else v_cache[cache_batch_idx.to(dtype=torch.long)]
+            ).to(dtype_ref)
+        else:
+            k_cache_select = rearrange(
+                k_cache_paged.to(dtype_ref)[page_table.to(dtype=torch.long).flatten()],
+                "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+                b=batch_size,
+            )[:, :seqlen_k].to(dtype_ref)
+            v_cache_select = rearrange(
+                v_cache_paged.to(dtype_ref)[page_table.to(dtype=torch.long).flatten()],
+                "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+                b=batch_size,
+            )[:, :seqlen_k].to(dtype_ref)
+        k_cache_ref = k_cache_ref.to(dtype).to(dtype_ref)
+        v_cache_ref = v_cache_ref.to(dtype).to(dtype_ref)
+        if dtype is not torch.float8_e4m3fn:
+            assert torch.equal(v_cache_select, v_cache_ref)
+        else:
+            assert torch.allclose(v_cache_select, v_cache_ref, rtol=1e-3, atol=1e-3)
+        # breakpoint()
+        # if rotary_dim == 0 and dtype is not torch.float8_e4m3fn:
+        if rotary_dim == 0:
+            assert torch.equal(k_cache_select, k_cache_ref)
+        else:
+            # if not torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3):
+            #     breakpoint()
+            if dtype is not torch.float8_e4m3fn:
+                assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
+            else:
+                assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-1, atol=1e-1)
+    mult = 4 if dtype == torch.float8_e4m3fn else 2
+    assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
+    mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
+    assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
+
 
 def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, device, dtype):
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
