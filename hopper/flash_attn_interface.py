@@ -571,6 +571,9 @@ def flash_attn_with_kvcache(
     max_seqlen_q: Optional[int] = None,
     softmax_scale=None,
     causal=False,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
     window_size=(-1, -1),  # -1 means infinite context window
     sink_token_length=0,
     softcap=0.0, # 0.0 means deactivated
@@ -677,6 +680,7 @@ def flash_attn_with_kvcache(
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     page_table = maybe_contiguous(page_table)
     cu_seqlens_q = maybe_contiguous(cu_seqlens_q)
+    # Do we need to call maybe_contiguous on descale?
     out, softmax_lse, *rest = flashattn_hopper_cuda.fwd_kvcache(
         q,
         k_cache,
@@ -694,7 +698,9 @@ def flash_attn_with_kvcache(
         max_seqlen_q,
         softmax_scale,
         causal,
-        None, None, None,  # qkv_descale
+        q_descale,
+        k_descale,
+        v_descale,
         window_size[0],
         window_size[1],
         sink_token_length,
