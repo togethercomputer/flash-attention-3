@@ -1184,7 +1184,7 @@ def test_flash_attn_kvcache(
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
-def test_flash_attn_kvcache_new(
+def test_new_flash_attn_kvcache_new(
     seqlen_q,
     seqlen_k,
     d,
