@@ -1132,9 +1132,9 @@ def test_flash_attn_kvcache(
 # eventually we should always use descale when fp8
 @pytest.mark.parametrize("use_descale", [False, True])
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
+# @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("num_splits", [1] + ([0] if not DISABLE_SPLIT else []))
 # @pytest.mark.parametrize("num_splits", [1])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -1324,7 +1324,8 @@ def test_new_flash_attn_kvcache_new(
     else:
         cos, sin = None, None
         q_ro, k_ro = q, k
-    if use_descale:
+    # eventually always use descale if fp8, switch for now for debugging
+    if dtype == torch.float8_e4m3fn and use_descale:
         dtype_descale = torch.float32
         q_descale = torch.rand((batch_size_cache,), dtype = dtype_descale, device = device)
         k_descale = torch.rand((batch_size_cache,), dtype = dtype_descale, device = device)
